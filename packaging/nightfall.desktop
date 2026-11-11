@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=Nightfall
-Comment=Плавный сдвиг времени выключения компьютера
+Comment=Плавный сдвиг времени выключения компьютера (иконка в трее)
 Exec=python3 %h/.local/share/nightfall/nightfall.py
 Icon=night-light-symbolic
 Terminal=false

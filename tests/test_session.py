@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
+import os
 import subprocess
 import unittest
 from pathlib import Path
@@ -166,3 +169,67 @@ class EnsureTrayTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StartupTest(unittest.TestCase):
+    """По умолчанию программа поднимает только иконку в трее, без окна."""
+
+    def test_default_start_keeps_window_closed(self) -> None:
+        from nightfall.cli import startup_plan
+
+        self.assertFalse(startup_plan(with_window=False, tray_available=True))
+
+    def test_explicit_flag_opens_window(self) -> None:
+        from nightfall.cli import startup_plan
+
+        self.assertTrue(startup_plan(with_window=True, tray_available=True))
+        self.assertTrue(startup_plan(with_window=True, tray_available=False))
+
+    def test_window_is_fallback_when_tray_missing(self) -> None:
+        from nightfall.cli import startup_plan
+
+        # без иконки и без окна пользователь не увидел бы вообще ничего
+        self.assertTrue(startup_plan(with_window=False, tray_available=False))
+
+    def test_headless_session_does_not_open_window(self) -> None:
+        from nightfall.cli import startup_plan
+
+        # нет ни X11, ни Wayland — окно открывать некуда, служба работает молча
+        self.assertFalse(startup_plan(with_window=False, tray_available=False,
+                                      has_display=False))
+        self.assertTrue(startup_plan(with_window=True, tray_available=True,
+                                     has_display=True))
+
+    def test_display_detection(self) -> None:
+        from nightfall.cli import display_available
+
+        with mock.patch.dict("os.environ", {"DISPLAY": ":0"}, clear=False):
+            self.assertTrue(display_available())
+        env = {key: value for key, value in os.environ.items()
+               if key not in ("DISPLAY", "WAYLAND_DISPLAY")}
+        with mock.patch.dict("os.environ", env, clear=True):
+            self.assertFalse(display_available())
+
+    def test_startup_without_tray_opens_window(self) -> None:
+        from nightfall import cli
+
+        client = mock.Mock()
+        with mock.patch.object(cli, "display_available", return_value=True), \
+                mock.patch.object(session, "ensure_tray", return_value=False), \
+                mock.patch.object(cli, "run_window", return_value=7) as run_window, \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(cli.run_startup(client, with_window=False), 7)
+        run_window.assert_called_once_with(client)
+
+    def test_startup_with_tray_leaves_window_closed(self) -> None:
+        from nightfall import cli
+
+        client = mock.Mock()
+        output = io.StringIO()
+        with mock.patch.object(cli, "display_available", return_value=True), \
+                mock.patch.object(session, "ensure_tray", return_value=True), \
+                mock.patch.object(cli, "run_window") as run_window, \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(cli.run_startup(client, with_window=False), 0)
+        run_window.assert_not_called()
+        self.assertIn("иконка", output.getvalue())

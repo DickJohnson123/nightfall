@@ -49,7 +49,7 @@ if [ "$WITH_AUTOSTART" = "1" ]; then
   mkdir -p "$AUTOSTART_DIR"
   sed "s|%h/.local/share/nightfall/nightfall.py|$DEST/nightfall.py|" \
       "$SRC/packaging/nightfall.desktop" > "$AUTOSTART_DIR/nightfall.desktop"
-  echo "→ Автозапуск окна: $AUTOSTART_DIR/nightfall.desktop"
+  echo "→ Автозапуск (иконка в трее, без окна): $AUTOSTART_DIR/nightfall.desktop"
 fi
 
 if [ "$WITH_SERVICE" = "1" ]; then

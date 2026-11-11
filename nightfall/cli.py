@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -32,7 +33,8 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "примеры:\n"
-            "  python3 nightfall.py                  # окно (фон уже работает)\n"
+            "  python3 nightfall.py                  # иконка в трее, без окна\n"
+            "  python3 nightfall.py --window         # сразу с окном\n"
             "  python3 nightfall.py --service        # фоновая служба без окна\n"
             "  python3 nightfall.py --status         # что запланировано\n"
             "  python3 nightfall.py --postpone 15    # отложить на 15 минут\n"
@@ -48,6 +50,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="запустить фоновую службу (без окна)")
     mode.add_argument("--popup-json", default=None, metavar="JSON",
                       help="служебное: показать всплывающее напоминание и выйти")
+    mode.add_argument("--window", action="store_true",
+                      help="сразу открыть окно (по умолчанию запускается только иконка в трее)")
     mode.add_argument("--tray", action="store_true",
                       help="иконка в системном трее (рядом с часами)")
     mode.add_argument("--tray-backend", default="auto",
@@ -240,6 +244,44 @@ def run_service(store: Store, socket: Optional[Path]) -> int:
     return daemon.run()
 
 
+def display_available() -> bool:
+    """Есть ли графическая сессия (X11 или Wayland)."""
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def startup_plan(with_window: bool, tray_available: bool, has_display: bool = True) -> bool:
+    """Открывать ли окно при запуске.
+
+    По умолчанию программа поднимает службу и иконку в трее, а окно не открывает:
+    при автозагрузке никто не хочет, чтобы что-то всплывало на весь экран.
+    Но если трей в системе не поднялся, окно открываем — иначе пользователь
+    останется без единого видимого признака, что программа работает.
+    """
+    if with_window:
+        return True
+    if not has_display:
+        return False  # графики нет: окно открывать некуда
+    return not tray_available
+
+
+def run_startup(client: DaemonClient, *, with_window: bool = False) -> int:
+    """Обычный запуск: служба + иконка в трее, окно — только по просьбе."""
+    if not client.ensure_daemon():
+        print("не удалось запустить фоновую службу", file=sys.stderr)
+    has_display = display_available()
+    tray_available = session.ensure_tray() if has_display else False
+    if startup_plan(with_window, tray_available, has_display):
+        if not tray_available and not with_window:
+            print("иконка в трее недоступна — открываю окно", file=sys.stderr)
+        return run_window(client)
+    if not has_display:
+        print("графической сессии нет: служба работает в фоне, без окна и без иконки")
+        return 0
+    print("Nightfall работает: иконка рядом с часами. "
+          "Клик по ней откроет окно, `nightfall --window` — сразу с окном.")
+    return 0
+
+
 def run_window(client: DaemonClient) -> int:
     if not client.ensure_daemon():
         print("не удалось запустить фоновую службу — окно откроется в режиме «нет связи»",
@@ -347,4 +389,4 @@ def main(argv: list[str] | None = None) -> int:
     if args.stop:
         return command_flag(store, client, "stop")
 
-    return run_window(client)
+    return run_startup(client, with_window=args.window)
