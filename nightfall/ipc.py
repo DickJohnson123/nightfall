@@ -19,6 +19,10 @@ class IpcError(RuntimeError):
     """Демон недоступен или ответил ошибкой."""
 
 
+class AlreadyRunning(RuntimeError):
+    """Сокет уже занят живым процессом — второй экземпляр не нужен."""
+
+
 def runtime_dir() -> Path:
     base = os.environ.get("XDG_RUNTIME_DIR")
     if base:
@@ -65,6 +69,17 @@ def request(payload: dict, *, timeout: float = 5.0, path: Optional[Path] = None)
     return reply
 
 
+def socket_is_live(path: Path) -> bool:
+    """За сокетом кто-то слушает? (файл может остаться от упавшего процесса)"""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.5)
+            sock.connect(str(path))
+        return True
+    except OSError:
+        return False
+
+
 def is_running(*, path: Optional[Path] = None, timeout: float = 1.0) -> bool:
     try:
         reply = request({"cmd": "ping"}, timeout=timeout, path=path)
@@ -97,6 +112,10 @@ class Server(threading.Thread):
     # ------------------------------------------------------------------ #
     def listen(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # чужой живой сокет не отбираем: иначе второй трей/окно тихо «уводит»
+        # адрес у первого, и иконка остаётся, но становится немой
+        if self.path.exists() and socket_is_live(self.path):
+            raise AlreadyRunning(str(self.path))
         try:
             self.path.unlink()
         except FileNotFoundError:

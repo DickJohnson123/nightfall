@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
 import os
 import shutil
 import subprocess
@@ -134,26 +136,25 @@ def request_tray(cmd: str) -> bool:
 # --------------------------------------------------------------------------- #
 #  Запуск процессов
 # --------------------------------------------------------------------------- #
-def spawn(args: list[str], *, interpreter: Optional[str] = None) -> bool:
+def spawn(args: list[str], *, interpreter: Optional[str] = None) -> Optional[subprocess.Popen]:
     script = launcher()
     if script is None:
-        return False
+        return None
     try:
-        subprocess.Popen(
+        return subprocess.Popen(
             [interpreter or sys.executable, str(script), *args, *child_args()],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
-        return True
     except OSError:
-        return False
+        return None
 
 
 def spawn_gui() -> bool:
     # именно --window: обычный запуск теперь поднимает только иконку в трее,
     # и без флага клик по иконке приводил бы к процессу без окна
-    return spawn(["--window"])
+    return spawn(["--window"]) is not None
 
 
 def _candidate_interpreters() -> list[str]:
@@ -205,28 +206,132 @@ def interpreter_for(backend: str) -> Optional[str]:
     return detect_all().get(backend)
 
 
-def ensure_tray() -> bool:
-    """Поднять иконку в трее, если её ещё нет и если системе это по силам."""
-    if tray_running():
-        return True
+TRAY_WAIT_SECONDS = 15.0      # сколько ждём появления сокета иконки
+TRAY_TOTAL_SECONDS = 20.0     # столько ждём иконку вообще, по всем бэкендам
+TRAY_LOCK_SECONDS = 10.0      # ждём блокировку, если трей поднимают одновременно
+
+
+def _tray_lock_path() -> Path:
+    return ipc.runtime_dir() / f"nightfall-tray-{os.getuid()}.lock"
+
+
+def _tray_cache_path() -> Path:
+    return ipc.runtime_dir() / f"nightfall-tray-{os.getuid()}.json"
+
+
+@contextlib.contextmanager
+def _tray_lock(timeout: float = TRAY_LOCK_SECONDS):
+    """Не даём двум запускам одновременно плодить иконки (автозагрузка + ручной)."""
+    import fcntl
+
+    path = _tray_lock_path()
+    handle = open(path, "w+")
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    break  # чужой запуск не отвечает — просто идём дальше
+                time.sleep(0.1)
+        yield
+    finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
+def _cached_backend() -> Optional[tuple[str, str]]:
+    """Что уже сработало в прошлый раз — чтобы не перебирать интерпретаторы."""
+    try:
+        raw = json.loads(_tray_cache_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    backend, interpreter = raw.get("backend"), raw.get("interpreter")
+    if isinstance(backend, str) and isinstance(interpreter, str) and Path(interpreter).exists():
+        return backend, interpreter
+    return None
+
+
+def _remember_backend(backend: str, interpreter: Optional[str]) -> None:
+    try:
+        _tray_cache_path().write_text(
+            json.dumps({"backend": backend, "interpreter": interpreter or sys.executable}),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def _forget_backend() -> None:
+    try:
+        _tray_cache_path().unlink()
+    except OSError:
+        pass
+
+
+def _tray_attempts() -> list[tuple[str, Optional[str]]]:
+    """Кого пробовать и в каком порядке. Первым — то, что сработало в прошлый раз."""
     forced = os.environ.get("NIGHTFALL_TRAY_BACKEND", "").strip()
     if forced and forced != "auto":
-        # бэкенду на GTK нужен интерпретатор с PyGObject — ищем его
-        backend, interpreter = forced, interpreter_for(forced)
-        args = ["--tray", "--tray-backend", forced]
-    else:
-        backend, interpreter = detect_tray()
-        args = ["--tray"]
-    if backend is None:
-        return False
-    if not spawn(args, interpreter=interpreter):
-        return False
-    deadline = time.monotonic() + 5.0
+        return [(forced, interpreter_for(forced))]
+    attempts: list[tuple[str, Optional[str]]] = []
+    cached = _cached_backend()
+    if cached is not None:
+        attempts.append(cached)
+    found = detect_all()
+    for backend in ("statusicon", "appindicator", "yad"):
+        interpreter = found.get(backend)
+        if interpreter is None:
+            continue
+        if any(backend == name for name, _ in attempts):
+            continue
+        attempts.append((backend, interpreter))
+    return attempts
+
+
+def _wait_for_tray(process: Optional[subprocess.Popen], wait: float) -> bool:
+    """Ждём, пока иконка поднимется. Если процесс умер — ждать бессмысленно."""
+    deadline = time.monotonic() + wait
     while time.monotonic() < deadline:
         if tray_running():
             return True
-        time.sleep(0.1)
-    return False
+        if process is not None and process.poll() is not None:
+            return tray_running()  # успел подняться и сразу передал сокет?
+        time.sleep(0.15)
+    return tray_running()
+
+
+def ensure_tray() -> bool:
+    """Поднять иконку в трее, если её ещё нет и если системе это по силам.
+
+    Запуск при входе в систему бывает медленным: PyGObject и GTK на холодную
+    стартуют секундами. Поэтому «сокета ещё нет» — это не отказ: ждём до
+    TRAY_WAIT_SECONDS, следим, жив ли процесс, и пробуем следующий бэкенд,
+    если выбранный сразу упал.
+    """
+    if tray_running():
+        return True
+    with _tray_lock():
+        if tray_running():
+            return True
+        deadline = time.monotonic() + TRAY_TOTAL_SECONDS
+        for backend, interpreter in _tray_attempts():
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break  # перебрали всё, что успевали: окно откроем, но честно скажем
+            args = ["--tray", "--tray-backend", backend]
+            process = spawn(args, interpreter=interpreter)
+            if process is None:
+                continue
+            if _wait_for_tray(process, min(TRAY_WAIT_SECONDS, left)):
+                _remember_backend(backend, interpreter)
+                return True
+        _forget_backend()
+        return False
 
 
 def stop_tray() -> bool:

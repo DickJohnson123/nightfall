@@ -134,11 +134,30 @@ class TrayDetectTest(unittest.TestCase):
             self.assertIsNone(session.interpreter_for("appindicator"))
 
 
+def alive_process():
+    """Живой дочерний процесс (Popen-заглушка)."""
+    process = mock.Mock()
+    process.poll.return_value = None
+    return process
+
+
+def dead_process():
+    process = mock.Mock()
+    process.poll.return_value = 1
+    return process
+
+
 class EnsureTrayTest(unittest.TestCase):
+    def setUp(self) -> None:
+        session._forget_backend()
+
+    def tearDown(self) -> None:
+        session._forget_backend()
+
     def test_no_backend_means_no_tray(self) -> None:
         with mock.patch.object(session, "tray_running", return_value=False), \
                 mock.patch.dict("os.environ", {"NIGHTFALL_TRAY_BACKEND": ""}), \
-                mock.patch.object(session, "detect_tray", return_value=(None, None)), \
+                mock.patch.object(session, "detect_all", return_value={}), \
                 mock.patch.object(session, "spawn") as spawn:
             self.assertFalse(session.ensure_tray())
         spawn.assert_not_called()
@@ -150,13 +169,78 @@ class EnsureTrayTest(unittest.TestCase):
         spawn.assert_not_called()
 
     def test_forced_backend_uses_interpreter_with_gtk(self) -> None:
-        with mock.patch.object(session, "tray_running", side_effect=[False, True]), \
+        with mock.patch.object(session, "tray_running", return_value=False), \
                 mock.patch.dict("os.environ", {"NIGHTFALL_TRAY_BACKEND": "statusicon"}), \
                 mock.patch.object(session, "interpreter_for", return_value="/usr/bin/python3"), \
-                mock.patch.object(session, "spawn", return_value=True) as spawn:
+                mock.patch.object(session, "spawn", return_value=alive_process()) as spawn, \
+                mock.patch.object(session, "_wait_for_tray", return_value=True):
             self.assertTrue(session.ensure_tray())
         self.assertEqual(spawn.call_args[0][0], ["--tray", "--tray-backend", "statusicon"])
         self.assertEqual(spawn.call_args[1]["interpreter"], "/usr/bin/python3")
+
+    def test_dead_backend_falls_back_to_next(self) -> None:
+        """Первый бэкенд упал — пробуем следующий, а не сдаёмся сразу."""
+        with mock.patch.object(session, "tray_running", return_value=False), \
+                mock.patch.dict("os.environ", {"NIGHTFALL_TRAY_BACKEND": ""}), \
+                mock.patch.object(session, "_tray_attempts",
+                                  return_value=[("statusicon", "/usr/bin/python3"),
+                                                ("yad", "/usr/local/bin/python3")]), \
+                mock.patch.object(session, "spawn",
+                                  side_effect=[dead_process(), alive_process()]) as spawn, \
+                mock.patch.object(session, "_wait_for_tray", side_effect=[False, True]):
+            self.assertTrue(session.ensure_tray())
+        self.assertEqual(spawn.call_count, 2)
+        self.assertEqual(spawn.call_args[0][0], ["--tray", "--tray-backend", "yad"])
+
+    def test_failed_start_is_reported_honestly(self) -> None:
+        with mock.patch.object(session, "tray_running", return_value=False), \
+                mock.patch.object(session, "_tray_attempts",
+                                  return_value=[("yad", "/usr/local/bin/python3")]), \
+                mock.patch.object(session, "spawn", return_value=dead_process()), \
+                mock.patch.object(session, "_wait_for_tray", return_value=False):
+            self.assertFalse(session.ensure_tray())
+
+    def test_slow_start_still_counts_as_success(self) -> None:
+        """На холодную GTK стартует секундами: подождать дешевле, чем открыть окно."""
+        answers = [False, False, False, True]  # до появления сокета и после
+        with mock.patch.object(session, "tray_running", side_effect=lambda: answers.pop(0)
+                               if answers else True), \
+                mock.patch.object(session, "spawn", return_value=alive_process()), \
+                mock.patch.object(session, "_tray_attempts",
+                                  return_value=[("statusicon", "/usr/bin/python3")]):
+            self.assertTrue(session.ensure_tray())
+
+    def test_overall_wait_is_capped(self) -> None:
+        """Три бэкенда по 15 секунд — это минута молчания; общий срок короче."""
+        with mock.patch.object(session, "tray_running", return_value=False), \
+                mock.patch.object(session, "TRAY_TOTAL_SECONDS", 0.0), \
+                mock.patch.object(session, "_tray_attempts",
+                                  return_value=[("statusicon", "/usr/bin/python3"),
+                                                ("yad", "/usr/local/bin/python3")]), \
+                mock.patch.object(session, "spawn") as spawn:
+            self.assertFalse(session.ensure_tray())
+        spawn.assert_not_called()
+
+    def test_working_backend_is_remembered(self) -> None:
+        with mock.patch.object(session, "tray_running", return_value=False), \
+                mock.patch.object(session, "_tray_attempts",
+                                  return_value=[("yad", "/usr/local/bin/python3")]), \
+                mock.patch.object(session, "spawn", return_value=alive_process()), \
+                mock.patch.object(session, "_wait_for_tray", return_value=True):
+            self.assertTrue(session.ensure_tray())
+        # следующий запуск начнёт с того, что уже сработало
+        self.assertEqual(session._cached_backend()[0], "yad")
+
+    def test_cache_is_dropped_after_failure(self) -> None:
+        session._remember_backend("yad", "/usr/local/bin/python3")
+        self.assertIsNotNone(session._cached_backend())
+        with mock.patch.object(session, "tray_running", return_value=False), \
+                mock.patch.object(session, "_tray_attempts",
+                                  return_value=[("yad", "/usr/local/bin/python3")]), \
+                mock.patch.object(session, "spawn", return_value=dead_process()), \
+                mock.patch.object(session, "_wait_for_tray", return_value=False):
+            self.assertFalse(session.ensure_tray())
+        self.assertIsNone(session._cached_backend())
 
     def test_quit_everything_stops_window_tray_and_daemon(self) -> None:
         client = mock.Mock()
@@ -172,10 +256,6 @@ class EnsureTrayTest(unittest.TestCase):
         client.quit_daemon.side_effect = ipc.IpcError("нет связи")
         with mock.patch.object(session, "quit_window"), mock.patch.object(session, "stop_tray"):
             session.quit_everything(client)  # не должно бросить исключение
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class StartupTest(unittest.TestCase):

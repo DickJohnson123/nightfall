@@ -337,7 +337,10 @@ def run(backend: Optional[str] = None) -> int:
     for name in chain:
         if session.tray_running():
             return 0  # иконка уже есть
-        code = runners[name](client)
+        try:
+            code = runners[name](client)
+        except ipc.AlreadyRunning:
+            return 0  # сокет занят другим треем — второй не нужен
         if code != 3:
             return code
     return 3

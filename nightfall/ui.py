@@ -477,8 +477,8 @@ class NightfallWindow:
         self.gui_server = ipc.Server(self._handle_command, path=session.gui_socket())
         try:
             self.gui_server.listen()
-        except OSError:
-            self.gui_server = None
+        except (OSError, ipc.AlreadyRunning):
+            self.gui_server = None  # окно уже открыто кем-то другим
         self.tray_active = False
         self.visible = True  # окно на экране: этим пользуется клик по иконке
 
