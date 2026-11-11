@@ -1,0 +1,16 @@
+[Unit]
+Description=Nightfall — планировщик постепенного отхода ко сну
+Documentation=https://github.com/DickJohnson123/nightfall
+After=graphical-session.target
+
+[Service]
+Type=simple
+# Замените %h/.local/share/nightfall на свой путь, если ставили вручную.
+# Добавьте --real, чтобы компьютер действительно выключался.
+ExecStart=/usr/bin/env python3 %h/.local/share/nightfall/nightfall.py --headless
+Restart=always
+RestartSec=15
+Nice=5
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Nightfall
+Comment=Плавный сдвиг времени выключения компьютера
+Exec=python3 %h/.local/share/nightfall/nightfall.py
+Icon=night-light-symbolic
+Terminal=false
+Categories=Utility;
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=5
