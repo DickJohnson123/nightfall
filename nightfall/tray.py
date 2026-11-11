@@ -28,7 +28,10 @@ from . import ipc, session
 ASSET = Path(__file__).resolve().parent.parent / "assets" / "nightfall.png"
 TITLE = "Nightfall"
 
-ORDER = ("appindicator", "statusicon", "yad")
+# statusicon первым: это единственный бэкенд, который отдаёт приложению сам
+# клик по иконке (левый клик = переключить окно). AppIndicator показывает меню
+# на любой клик — это его внутреннее поведение, а не наш выбор.
+ORDER = ("statusicon", "appindicator", "yad")
 
 
 # --------------------------------------------------------------------------- #
@@ -112,12 +115,13 @@ def icon_path() -> str:
 # --------------------------------------------------------------------------- #
 #  Общие действия меню
 # --------------------------------------------------------------------------- #
+def _toggle() -> None:
+    """Левый клик по иконке: окно открывается, если закрыто, и наоборот."""
+    session.toggle_window()
+
+
 def _show() -> None:
     session.show_window()
-
-
-def _hide() -> None:
-    session.hide_window()
 
 
 def _quit(client, stop_main) -> None:
@@ -146,16 +150,6 @@ def _build_menu(Gtk, client, stop_main):
     from gi.repository import GLib  # noqa: PLC0415
 
     menu = Gtk.Menu()
-
-    open_item = Gtk.MenuItem(label="Открыть окно")
-    open_item.connect("activate", lambda *_: _show())
-    menu.append(open_item)
-
-    hide_item = Gtk.MenuItem(label="Скрыть окно")
-    hide_item.connect("activate", lambda *_: _hide())
-    menu.append(hide_item)
-
-    menu.append(Gtk.SeparatorMenuItem())
 
     status_item = Gtk.MenuItem(label=_status_text(client))
     status_item.set_sensitive(False)
@@ -197,10 +191,6 @@ def _run_appindicator(client) -> int:
 
     menu = _build_menu(Gtk, client, Gtk.main_quit)
     indicator.set_menu(menu)
-    try:  # средняя/вторичная кнопка открывает окно
-        indicator.set_secondary_activate_target(menu.get_children()[0])
-    except (AttributeError, TypeError):
-        pass
 
     Gtk.main()
     server.stop()
@@ -219,7 +209,7 @@ def _run_statusicon(client) -> int:
     icon.set_visible(True)
 
     menu = _build_menu(Gtk, client, Gtk.main_quit)
-    icon.connect("activate", lambda *_: _show())
+    icon.connect("activate", lambda *_: _toggle())
     icon.connect(
         "popup-menu",
         lambda widget, button, activate_time: menu.popup(
@@ -263,22 +253,14 @@ def _run_yad(client) -> int:
         # в другой экземпляр программы (с путями по умолчанию)
         return " ".join(shlex.quote(part) for part in [python, str(script), *args, *session.child_args()])
 
-    menu = "|".join(
-        [
-            f"Открыть окно!{command('--show')}",
-            f"Скрыть окно!{command('--hide')}",
-            "!",
-            f"Остановить службу и выйти!{command('--quit')}",
-            "",
-        ]
-    )
+    menu = f"Остановить службу и выйти!{command('--quit')}"
     process = subprocess.Popen(
         [
             yad,
             "--notification",
             f"--image={icon_path()}",
             f"--text={TITLE} — {_status_text(client)}",
-            f"--command={command('--show')}",
+            f"--command={command('--toggle')}",
             f"--menu={menu}",
             "--title=Nightfall",
         ],
@@ -322,6 +304,9 @@ def _handle(payload: dict, Gtk, _unused) -> dict:
         return {"ok": True, "pid": os.getpid()}
     if cmd == "show":
         _show()
+        return {"ok": True}
+    if cmd == "toggle":
+        _toggle()
         return {"ok": True}
     return {"ok": False, "error": f"неизвестная команда: {cmd}"}
 

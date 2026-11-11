@@ -22,6 +22,108 @@ from typing import Callable, Optional
 from . import ipc, notify, schedule, session
 
 
+def _close_button_only(root) -> None:
+    """Оставить в заголовке окна только крестик.
+
+    Кнопки «свернуть»/«развернуть» рисует оконный менеджер, поэтому просим
+    его об этом подсказками Motif (_MOTIF_WM_HINTS): убираем из списка
+    разрешённых действий минимизацию и разворачивание. Подсказки понимают
+    mutter, xfwm, kwin, marco, openbox, icewm. Где их игнорируют (Wayland без
+    X11), оформление остаётся штатным — на работу это не влияет.
+    """
+    import ctypes
+
+    try:
+        lib = ctypes.CDLL("libX11.so.6")
+    except OSError:
+        return  # не X11 — молча живём с обычным заголовком
+
+    # без явных argtypes ctypes обрезает 64-битные указатели и падает
+    lib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    lib.XOpenDisplay.restype = ctypes.c_void_p
+    lib.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+    lib.XInternAtom.restype = ctypes.c_ulong
+    lib.XChangeProperty.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong,
+        ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_int,
+    ]
+    lib.XChangeProperty.restype = ctypes.c_int
+    lib.XQueryTree.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_ulong)), ctypes.POINTER(ctypes.c_uint),
+    ]
+    lib.XQueryTree.restype = ctypes.c_int
+    lib.XFree.argtypes = [ctypes.c_void_p]
+    lib.XFree.restype = ctypes.c_int
+    lib.XFlush.argtypes = [ctypes.c_void_p]
+    lib.XFlush.restype = ctypes.c_int
+    lib.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    lib.XCloseDisplay.restype = ctypes.c_int
+
+    class MotifWmHints(ctypes.Structure):
+        _fields_ = [
+            ("flags", ctypes.c_ulong),
+            ("functions", ctypes.c_ulong),
+            ("decorations", ctypes.c_ulong),
+            ("input_mode", ctypes.c_long),
+            ("status", ctypes.c_ulong),
+        ]
+
+    try:
+        window = int(root.winfo_id())
+    except (tk.TclError, ValueError):
+        return
+
+    display = lib.XOpenDisplay(None)
+    if not display:
+        return
+    try:
+        # WM управляет не самим winfo_id, а обёрткой над ним: поднимаемся
+        # по дереву окон, пока не упрёмся в корневое
+        targets = [window]
+        root_window = ctypes.c_ulong()
+        parent = ctypes.c_ulong()
+        current = ctypes.c_ulong(window)
+        for _ in range(6):
+            # NULL вместо массивов Xlib не принимает — падает, поэтому передаём
+            # настоящие указатели и освобождаем список детей
+            children = ctypes.POINTER(ctypes.c_ulong)()
+            count = ctypes.c_uint()
+            ok = lib.XQueryTree(
+                display, current,
+                ctypes.byref(root_window), ctypes.byref(parent),
+                ctypes.byref(children), ctypes.byref(count),
+            )
+            if children:
+                lib.XFree(children)
+            if not ok or parent.value in (0, root_window.value):
+                break
+            current = ctypes.c_ulong(parent.value)
+            targets.append(parent.value)
+
+        hints_functions, hints_decorations = 1, 2
+        func_all, func_resize, func_move, func_close = 0x1, 0x2, 0x4, 0x20
+        hints = MotifWmHints(
+            flags=hints_functions | hints_decorations,
+            functions=func_all | func_resize | func_move | func_close,  # без minimize/maximize
+            decorations=0x1,  # оформление как обычно, но без лишних кнопок
+            input_mode=0,
+            status=0,
+        )
+        atom = lib.XInternAtom(display, b"_MOTIF_WM_HINTS", 0)
+        for target in targets:
+            lib.XChangeProperty(
+                display, ctypes.c_ulong(target), atom, atom, 32, 0,
+                ctypes.cast(ctypes.byref(hints), ctypes.c_void_p), 5,
+            )
+        lib.XFlush(display)
+    except Exception:  # noqa: BLE001 - оформление окна не критично
+        pass
+    finally:
+        lib.XCloseDisplay(display)
+
+
 def _dbg(message: str) -> None:
     """Отладка запуска/скрытия окна: NIGHTFALL_DEBUG=1 python3 nightfall.py"""
     if os.environ.get("NIGHTFALL_DEBUG"):
@@ -299,6 +401,12 @@ class NightfallWindow:
         self.ctrl = client
         self.root = tk.Tk()
         self.root.title("Nightfall — плавное засыпание")
+        try:
+            # окно постоянного размера: сворачивать и разворачивать его незачем,
+            # поэтому просим WM оформить его как диалог — только с крестиком
+            self.root.attributes("-type", "dialog")
+        except tk.TclError:  # pragma: no cover - не X11
+            pass
         self.root.configure(bg=C["bg0"])
         self.scale = self._detect_scale()
         self.fonts = Fonts(self.root, self.scale)
@@ -317,6 +425,8 @@ class NightfallWindow:
         except OSError:
             self.gui_server = None
         self.tray_active = False
+        self.visible = True  # окно на экране: этим пользуется клик по иконке
+        self._titlebar_fixed = False
 
         self.online = client.is_running()
         self.view: Optional[RemoteView] = client.last_view
@@ -333,8 +443,10 @@ class NightfallWindow:
         self.root.bind("<Control-q>", lambda _e: self.on_close_request())
         self.root.bind("<Control-h>", lambda _e: self.hide_window())
         self.root.protocol("WM_DELETE_WINDOW", self.on_close_request)
-        # после разворачивания окна кадр мог устареть — рисуем заново
-        self.root.bind("<Map>", lambda _e: self.render())
+        # после разворачивания окна кадр мог устареть — рисуем заново,
+        # а заодно просим WM оставить в заголовке только крестик
+        self.root.bind("<Map>", self._on_map)
+        self.root.after(300, self._fix_titlebar)
 
         self.render()
         self.root.after(500, self.tick)
@@ -342,6 +454,16 @@ class NightfallWindow:
         threading.Thread(target=self._start_tray, daemon=True).start()
 
     # ------------------------------------------------------------------ #
+    def _on_map(self, _event=None) -> None:
+        self.render()
+        self._fix_titlebar()
+
+    def _fix_titlebar(self) -> None:
+        if self._titlebar_fixed:
+            return
+        self._titlebar_fixed = True
+        _close_button_only(self.root)
+
     def _detect_scale(self) -> float:
         try:
             dpi = self.root.winfo_fpixels("1i")
@@ -367,7 +489,9 @@ class NightfallWindow:
         cmd = str(payload.get("cmd", ""))
         if cmd == "ping":
             return {"ok": True, "pid": os.getpid()}
-        if cmd in ("show", "hide", "quit"):
+        if cmd == "status":
+            return {"ok": True, "pid": os.getpid(), "visible": self.visible}
+        if cmd in ("show", "hide", "toggle", "quit"):
             self._commands.put(cmd)
             return {"ok": True, "pid": os.getpid()}
         return {"ok": False, "error": f"неизвестная команда: {cmd}"}
@@ -381,6 +505,8 @@ class NightfallWindow:
                     self.show_window()
                 elif cmd == "hide":
                     self.hide_window()
+                elif cmd == "toggle":
+                    self.hide_window() if self.visible else self.show_window()
                 elif cmd == "quit":
                     self.close()
         except queue.Empty:
@@ -388,6 +514,7 @@ class NightfallWindow:
         self.root.after(150, self._pump_commands)
 
     def show_window(self) -> None:
+        self.visible = True
         self.root.deiconify()
         self.root.lift()
         try:
@@ -400,6 +527,7 @@ class NightfallWindow:
     def hide_window(self) -> None:
         """Спрятать окно, оставив иконку в трее (процесс продолжает жить)."""
         _dbg("hide_window")
+        self.visible = False
         self.root.withdraw()
         if not getattr(self, "_hid_notice", False):
             self._hid_notice = True
@@ -420,6 +548,7 @@ class NightfallWindow:
 
     def close(self) -> None:
         """Полный выход из окна. Служба продолжает работать."""
+        self.visible = False
         if self.gui_server is not None:
             self.gui_server.stop()
         self.root.destroy()

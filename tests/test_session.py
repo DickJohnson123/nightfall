@@ -55,6 +55,26 @@ class WindowTest(unittest.TestCase):
             self.assertTrue(session.show_window())
         spawn.assert_called_once_with()
 
+    def test_toggle_asks_live_window(self) -> None:
+        with mock.patch.object(session, "request_gui", return_value=True) as request, \
+                mock.patch.object(session, "spawn_gui") as spawn:
+            self.assertTrue(session.toggle_window())
+        request.assert_called_once_with("toggle")
+        spawn.assert_not_called()
+
+    def test_toggle_opens_window_when_none_runs(self) -> None:
+        with mock.patch.object(session, "request_gui", return_value=False), \
+                mock.patch.object(session, "spawn_gui", return_value=True) as spawn:
+            self.assertTrue(session.toggle_window())
+        spawn.assert_called_once_with()
+
+    def test_gui_visible_reports_visibility(self) -> None:
+        answer = {"ok": True, "visible": False}
+        with mock.patch.object(ipc, "request", return_value=answer):
+            self.assertFalse(session.gui_visible())
+        with mock.patch.object(ipc, "request", side_effect=ipc.IpcError("нет окна")):
+            self.assertIsNone(session.gui_visible())
+
     def test_hide_and_quit_never_launch_anything(self) -> None:
         with mock.patch.object(session, "request_gui", return_value=False), \
                 mock.patch.object(session, "spawn_gui") as spawn:
@@ -87,7 +107,14 @@ class TrayDetectTest(unittest.TestCase):
             found = session.detect_all()
             self.assertEqual(found["yad"], "/usr/local/bin/python3")
             self.assertEqual(found["appindicator"], "/usr/bin/python3")
-            self.assertEqual(session.detect_tray(), ("appindicator", "/usr/bin/python3"))
+            # классический XEmbed-трей важнее: он отдаёт приложению клик по иконке
+            self.assertEqual(session.detect_tray(), ("statusicon", "/usr/bin/python3"))
+
+    def test_statusicon_preferred_over_appindicator(self) -> None:
+        mapping = {"/usr/bin/python3": "appindicator statusicon"}
+        with mock.patch.object(session, "_candidate_interpreters",
+                               return_value=list(mapping)), self._probe(mapping):
+            self.assertEqual(session.detect_tray()[0], "statusicon")
 
     def test_interpreter_for_forced_backend(self) -> None:
         mapping = {"/usr/local/bin/python3": "yad", "/usr/bin/python3": "statusicon"}

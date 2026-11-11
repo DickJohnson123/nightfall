@@ -63,6 +63,8 @@ def build_parser() -> argparse.ArgumentParser:
     actions.add_argument("--shutdown-now", action="store_true", help="выключить компьютер сейчас")
     actions.add_argument("--stop", action="store_true", help="остановить фоновую службу")
     actions.add_argument("--show", action="store_true", help="показать окно")
+    actions.add_argument("--toggle", action="store_true",
+                         help="переключить окно: спрятать, если открыто, открыть, если нет")
     actions.add_argument("--hide", action="store_true", help="спрятать окно в трей")
     actions.add_argument("--quit", action="store_true",
                          help="остановить окно, трей и службу")
@@ -298,6 +300,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.show:
         ok = session.show_window()
         print("окно показано" if ok else "не удалось открыть окно", file=sys.stderr)
+        return 0 if ok else 1
+
+    if args.toggle:
+        ok = session.toggle_window()
+        print("окно переключено" if ok else "не удалось переключить окно", file=sys.stderr)
         return 0 if ok else 1
 
     if args.hide:

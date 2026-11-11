@@ -81,6 +81,24 @@ def gui_running() -> bool:
     return request_gui("ping")
 
 
+def gui_visible() -> Optional[bool]:
+    """Окно на экране? None — окна вообще нет."""
+    try:
+        answer = ipc.request({"cmd": "status"}, path=gui_socket(), timeout=2.0)
+    except ipc.IpcError:
+        return None
+    if not answer.get("ok"):
+        return None
+    return bool(answer.get("visible"))
+
+
+def toggle_window() -> bool:
+    """Клик по иконке: открытое окно спрятать, спрятанное — открыть."""
+    if request_gui("toggle"):
+        return True
+    return spawn_gui()
+
+
 def show_window() -> bool:
     """Показать окно: разбудить спрятанное или открыть новое."""
     if request_gui("show"):
@@ -174,7 +192,7 @@ def detect_all() -> dict[str, str]:
 def detect_tray() -> tuple[Optional[str], Optional[str]]:
     """Лучший бэкенд трея и подходящий для него интерпретатор."""
     found = detect_all()
-    for backend in ("appindicator", "statusicon", "yad"):
+    for backend in ("statusicon", "appindicator", "yad"):
         if backend in found:
             return backend, found[backend]
     return None, None
