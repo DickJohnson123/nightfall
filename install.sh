@@ -61,5 +61,9 @@ if [ "$WITH_SERVICE" = "1" ]; then
 fi
 
 echo
-echo "Готово. Запуск: nightfall      (или: python3 $DEST/nightfall.py)"
+echo "Готово."
+echo "  nightfall                 # окно (служба поднимется сама)"
+echo "  nightfall --service       # только служба, без окна"
+echo "  nightfall --status        # что запланировано"
+echo "  nightfall --postpone 15   # отложить выключение"
 echo "Сейчас режим имитации — реальное выключение включается в настройках или флагом --real."

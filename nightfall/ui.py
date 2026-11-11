@@ -15,10 +15,9 @@ from datetime import datetime, timedelta
 from tkinter import font as tkfont, messagebox
 from typing import Callable, Optional
 
-from . import schedule
-from .controller import Controller, View
+from . import ipc, schedule
+from .client import DaemonClient, RemoteView
 from .schedule import Settings, fmt_hm, human_delta
-from .storage import export_history
 
 # --------------------------------------------------------------------------- #
 #  Палитра
@@ -284,8 +283,10 @@ def font_measure(surface: CanvasSurface, text: str, font) -> float:
 #  Главное окно
 # --------------------------------------------------------------------------- #
 class NightfallWindow:
-    def __init__(self, controller: Controller) -> None:
-        self.ctrl = controller
+    """Окно — всего лишь клиент демона: закрытие окна ничего не останавливает."""
+
+    def __init__(self, client: DaemonClient) -> None:
+        self.ctrl = client
         self.root = tk.Tk()
         self.root.title("Nightfall — плавное засыпание")
         self.root.configure(bg=C["bg0"])
@@ -293,16 +294,19 @@ class NightfallWindow:
         self.fonts = Fonts(self.root, self.scale)
         self.surface = CanvasSurface(self.root, DESIGN_W, DESIGN_H, self.scale, C["bg0"])
         self.surface.redraw = self.render
-        self.surface.pack(fill="both", expand=True)
+        # центр вместо растягивания: тайловые WM могут развернуть окно на весь экран
+        self.surface.place(relx=0.5, rely=0.5, anchor="center")
         self.root.resizable(False, False)
         self._center_window()
 
-        self.view: View = controller.view()
-        self.popups: list["Popup"] = []
+        self.online = client.is_running()
+        self.view: Optional[RemoteView] = client.last_view
+        if self.view is None:
+            try:
+                self.view = client.view()
+            except ipc.IpcError:
+                self.view = None
         self.settings_dialog: Optional["SettingsDialog"] = None
-
-        controller.on_reminder = self.show_reminder
-        controller.on_shutdown = self.show_shutdown
 
         self.root.bind("<Control-p>", lambda _e: self.ctrl.postpone())
         self.root.bind("<Control-P>", lambda _e: self.ctrl.postpone(30))
@@ -324,16 +328,21 @@ class NightfallWindow:
             return 1.0
 
     def _center_window(self) -> None:
-        self.root.update_idletasks()
-        width, height = self.root.winfo_width(), self.root.winfo_height()
+        width = int(DESIGN_W * self.scale)
+        height = int(DESIGN_H * self.scale)
         x = max(0, (self.root.winfo_screenwidth() - width) // 2)
         y = max(0, (self.root.winfo_screenheight() - height) // 2 - 24)
         self.root.geometry(f"{width}x{height}+{x}+{y}")
 
     def close(self) -> None:
-        for popup in list(self.popups):
-            popup.close()
+        """Закрыть окно. Демон продолжает работать — расписание не останавливается."""
         self.root.destroy()
+
+    def restart_daemon(self) -> None:
+        if self.ctrl.ensure_daemon():
+            self.online = True
+            self.view = self.ctrl.view()
+        self.render()
 
     def run(self) -> None:
         self.root.mainloop()
@@ -342,10 +351,19 @@ class NightfallWindow:
     def tick(self) -> None:
         try:
             self.view = self.ctrl.tick()
-            if self._needs_render():
-                self.render()
+            self.online = True
+        except ipc.IpcError:
+            # демон не отвечает: показываем последнее известное состояние
+            if self.online or self.view is None:
+                self.online = False
+                self._frame_key = None
         except Exception as error:  # pragma: no cover
             print("nightfall: ошибка кадра:", error)
+        try:
+            if self.view is not None and self._needs_render():
+                self.render()
+        except Exception as error:  # pragma: no cover
+            print("nightfall: ошибка отрисовки:", error)
         self.root.after(1000, self.tick)
 
     def _needs_render(self) -> bool:
@@ -360,6 +378,8 @@ class NightfallWindow:
         except tk.TclError:  # pragma: no cover
             pass
         v = self.view
+        if v is None:
+            return True
         seconds = max(0.0, v.remaining.total_seconds())
         quantum = 1 if seconds < 3600 else 60
         key = (
@@ -377,6 +397,8 @@ class NightfallWindow:
             len(v.history),
             v.settings,
             v.settings.dry_run,
+            self.online,
+            self.ctrl.pid,
         )
         if key == getattr(self, "_frame_key", None):
             return False
@@ -414,45 +436,6 @@ class NightfallWindow:
     # ------------------------------------------------------------------ #
     #  Всплывающие окна
     # ------------------------------------------------------------------ #
-    def _spawn(self, popup: "Popup") -> None:
-        for old in list(self.popups):
-            old.close()
-        self.popups.append(popup)
-
-    def show_reminder(self, night, reminder: schedule.Reminder) -> None:
-        minutes = reminder.remaining_minutes
-        urgent = minutes <= 10
-        accent = C["red"] if urgent else C["violet2"]
-        title = f"Осталось {minutes} мин"
-        lines = [
-            f"Выключение в {fmt_hm(reminder.shutdown_at)}"
-            + (f" · перенос +{night.postponed_minutes} мин" if night.postponed_minutes else ""),
-            "Успевай закрыть дела — или отложи сон ещё немного.",
-        ]
-        buttons = [
-            (f"+{self.view.settings.postpone_minutes} мин", "primary", lambda: self._popup_postpone()),
-            ("Понятно", "ghost", self._close_popups),
-        ]
-        self._spawn(Popup(self, title, lines, buttons, accent, autoclose=30))
-
-    def show_shutdown(self, night, ok: bool, message: str) -> None:
-        accent = C["green"] if ok else C["red"]
-        title = "Выключаем компьютер" if ok else "Не удалось выключить"
-        lines = [
-            f"Фактическое время: {fmt_hm(night.actual or datetime.now())}",
-            message,
-        ]
-        self._spawn(Popup(self, title, lines, [("Хорошо", "ghost", self._close_popups)], accent, autoclose=15))
-
-    def _popup_postpone(self) -> None:
-        self.ctrl.postpone()
-        self._close_popups()
-
-    def _close_popups(self) -> None:
-        for popup in list(self.popups):
-            popup.close()
-        self.popups.clear()
-
     # ------------------------------------------------------------------ #
     #  Отрисовка
     # ------------------------------------------------------------------ #
@@ -463,10 +446,29 @@ class NightfallWindow:
         if first_paint:
             self._background()
             s.protect_static()  # градиент и свечение больше не перерисовываем
+        if self.view is None:
+            self._offline_screen()
+            return
         self._header()
         self._hero()
         self._chart()
         self._footer()
+
+    def _offline_screen(self) -> None:
+        p, f = self.surface.p, self.fonts
+        self._card(32, 96, 988, 478)
+        p.text(510, 190, "Нет связи с фоновой службой", f.title, C["text"], anchor="center")
+        p.text(
+            510, 226,
+            "Расписание сейчас не работает: напоминаний и выключения не будет.",
+            f.label, C["muted"], anchor="center",
+        )
+        p.text(510, 252, "Запустите фон — он поднимется отдельным процессом и продолжит "
+                         "работать даже после закрытия окна.", f.small, C["faint"], anchor="center")
+        self.surface.button(390, 300, 630, 348, "Запустить фон", f.btn,
+                            self.restart_daemon, kind="primary", radius=14)
+        p.text(510, 380, "или из терминала:  python3 nightfall.py --service", f.small,
+               C["faint"], anchor="center")
 
     def _glow(self, cx, cy, radius, color, strength) -> None:
         p = self.surface.p
@@ -511,7 +513,22 @@ class NightfallWindow:
         p.oval(x1 + 14, 39, x1 + 22, 47, fill=color)
         p.text(x1 + 30, 43, text, f.chip, color, anchor="w")
 
-        p.text(x1 - 16, 43, v.now.strftime("%H:%M"), f.clock, C["muted"], anchor="e")
+        # состояние фоновой службы
+        if self.online:
+            daemon_text = f"ФОН · {self.ctrl.pid or '—'}"
+            daemon_color = C["cyan"]
+        else:
+            daemon_text = "ФОН ОСТАНОВЛЕН"
+            daemon_color = C["red"]
+        daemon_width = font_measure(self.surface, daemon_text, f.chip) + 42
+        dx2 = x1 - 10
+        dx1 = dx2 - daemon_width
+        p.rrect(dx1, 29, dx2, 57, 14, fill=mix(C["card"], daemon_color, 0.15),
+                outline=mix(C["card"], daemon_color, 0.45))
+        p.oval(dx1 + 14, 39, dx1 + 22, 47, fill=daemon_color)
+        p.text(dx1 + 30, 43, daemon_text, f.chip, daemon_color, anchor="w")
+
+        p.text(dx1 - 16, 43, v.now.strftime("%H:%M"), f.clock, C["muted"], anchor="e")
 
     # -- карточки --------------------------------------------------------- #
     def _card(self, x1, y1, x2, y2, fill=None) -> None:
@@ -544,6 +561,8 @@ class NightfallWindow:
             "urgent": ("пора спать", C["red"]),
             "done": ("ночь закрыта", C["green"]),
         }[phase]
+        if not self.online:
+            status = ("фон остановлен", C["red"])
         self._tag(490, 122, status[0], status[1], anchor="e")
 
         seconds = v.remaining.total_seconds()
@@ -656,8 +675,12 @@ class NightfallWindow:
 
         y1, y2 = 422, 462
         half = (right - left - gap) / 2
-        self.surface.button(left, y1, left + half, y2, "Выключить сейчас", f.btn_sm,
-                            self.ctrl.shutdown_now, kind="danger", enabled=not v.night.settled)
+        if self.online:
+            self.surface.button(left, y1, left + half, y2, "Выключить сейчас", f.btn_sm,
+                                self.ctrl.shutdown_now, kind="danger", enabled=not v.night.settled)
+        else:
+            self.surface.button(left, y1, left + half, y2, "Запустить фон", f.btn_sm,
+                                self.restart_daemon, kind="primary")
         self.surface.button(left + half + gap, y1, right, y2, "Настройки", f.btn_sm,
                             self.open_settings, kind="ghost")
 
@@ -747,20 +770,22 @@ class NightfallWindow:
 #  Всплывающее окно
 # --------------------------------------------------------------------------- #
 class Popup(tk.Toplevel):
+    """Короткоживущее окно-напоминание. Живёт отдельным процессом."""
+
     W, H = 468, 208
 
-    def __init__(self, app: NightfallWindow, title: str, lines: list[str],
-                 buttons: list[tuple[str, str, Callable[[], None]]], accent: str,
-                 autoclose: int = 30) -> None:
-        super().__init__(app.root)
-        self.app = app
+    def __init__(self, root: tk.Misc, fonts: "Fonts", scale: float, title: str,
+                 lines: list[str], buttons: list[tuple[str, str, Callable[[], None]]],
+                 accent: str, autoclose: int = 30) -> None:
+        super().__init__(root)
+        self.fonts = fonts
         self.title_text = title
         self.lines = lines
         self.buttons = buttons
         self.accent = accent
         self.autoclose = autoclose
         self.total = autoclose
-        self.scale = app.scale
+        self.scale = scale
         self.overrideredirect(True)
         try:
             self.attributes("-topmost", True)
@@ -797,7 +822,7 @@ class Popup(tk.Toplevel):
         self.after(1000, self._tick)
 
     def render(self) -> None:
-        p, f = self.surface.p, self.app.fonts
+        p, f = self.surface.p, self.fonts
         s = self.surface
         s.begin()
         p.rrect(0, 0, self.W, self.H, 20, fill=C["card2"], outline=mix(C["card2"], self.accent, 0.55), width=1.5)
@@ -916,6 +941,7 @@ class SettingsDialog(tk.Toplevel):
         self._button(actions, "Отмена", self.close, "ghost").pack(side="right", padx=(0, 8))
         self._button(actions, "Сбросить прогресс", self.reset, "danger").pack(side="left")
         self._button(actions, "Журнал в буфер", self.copy_log, "ghost").pack(side="left", padx=(8, 0))
+        self._button(actions, "Остановить фон", self.stop_daemon, "ghost").pack(side="left", padx=(8, 0))
 
         self.update_idletasks()
         width, height = self.winfo_width(), self.winfo_height()
@@ -972,9 +998,29 @@ class SettingsDialog(tk.Toplevel):
             self.controller.reset_progress()
             self.close()
 
+    def stop_daemon(self) -> None:
+        if not messagebox.askyesno(
+            "Nightfall",
+            "Остановить фоновую службу?\n\nРасписание и напоминания перестанут "
+            "работать, пока вы снова не запустите Nightfall.",
+            parent=self,
+        ):
+            return
+        try:
+            self.controller.quit_daemon()
+        except ipc.IpcError:
+            pass
+        self.app.online = False
+        self.close()
+
     def copy_log(self) -> None:
+        try:
+            text = self.controller.export_history()
+        except ipc.IpcError as error:
+            messagebox.showerror("Nightfall", f"Фон не отвечает: {error}", parent=self)
+            return
         self.clipboard_clear()
-        self.clipboard_append(export_history(self.controller.state))
+        self.clipboard_append(text)
         messagebox.showinfo("Nightfall", "История скопирована в буфер обмена.", parent=self)
 
     def close(self) -> None:
@@ -987,7 +1033,52 @@ class SettingsDialog(tk.Toplevel):
 
 
 # --------------------------------------------------------------------------- #
-def run_gui(controller: Controller) -> int:
-    window = NightfallWindow(controller)
+def run_popup(payload: dict, client: DaemonClient, scale: Optional[float] = None) -> int:
+    """Показать напоминание отдельным процессом и выйти (его зовёт демон)."""
+    root = tk.Tk()
+    root.withdraw()
+    root.configure(bg=C["bg0"])
+    if scale is None:
+        try:
+            scale = max(1.0, min(1.6, round(root.winfo_fpixels("1i") / 96.0, 2)))
+        except tk.TclError:  # pragma: no cover
+            scale = 1.0
+    fonts = Fonts(root, scale)
+
+    def postpone() -> None:
+        try:
+            client.postpone(payload.get("postpone"))
+        except ipc.IpcError:
+            pass
+        root.destroy()
+
+    def dismiss() -> None:
+        root.destroy()
+
+    kind = payload.get("kind", "reminder")
+    if kind == "reminder":
+        buttons = [
+            (f"+{payload.get('postpone', 15)} мин", "primary", postpone),
+            ("Понятно", "ghost", dismiss),
+        ]
+    else:
+        buttons = [("Хорошо", "ghost", dismiss)]
+
+    lines = [payload.get("line1", ""), payload.get("line2", "")]
+    popup = Popup(
+        root, fonts, scale,
+        str(payload.get("title", "Nightfall")),
+        [line for line in lines if line],
+        buttons,
+        str(payload.get("accent", C["violet2"])),
+        autoclose=int(payload.get("autoclose", 30)),
+    )
+    popup.focus_force()
+    root.mainloop()
+    return 0
+
+
+def run_gui(client: DaemonClient) -> int:
+    window = NightfallWindow(client)
     window.run()
     return 0

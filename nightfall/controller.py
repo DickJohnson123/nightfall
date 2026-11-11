@@ -58,6 +58,44 @@ class View:
         return "idle"
 
 
+def view_to_dict(view: View) -> dict:
+    """Снимок состояния в JSON-совместимый вид (для демона и его клиентов)."""
+    night = view.night
+    return {
+        "now": view.now.isoformat(timespec="seconds"),
+        "phase": view.phase,
+        "evening": night.evening.isoformat(),
+        "target": night.target.isoformat(timespec="minutes"),
+        "shutdown_at": night.shutdown_at.isoformat(timespec="minutes"),
+        "actual": night.actual.isoformat(timespec="minutes") if night.actual else None,
+        "skipped": night.skipped,
+        "settled": night.settled,
+        "postponed": view.postponed,
+        "remaining_seconds": int(view.remaining.total_seconds()),
+        "next_reminder_at": (
+            view.next_reminder_at.isoformat(timespec="minutes") if view.next_reminder_at else None
+        ),
+        "at_goal": view.at_goal,
+        "tomorrow": view.tomorrow.isoformat(timespec="minutes"),
+        "settings": view.settings.to_dict(),
+        "state_path": view.state_path,
+        "history": [
+            {
+                "evening": item.evening.isoformat(),
+                "target": item.target.isoformat(timespec="minutes"),
+                "outcome": item.outcome.isoformat(timespec="minutes"),
+                "actual": item.actual.isoformat(timespec="minutes") if item.actual else None,
+                "skipped": item.skipped,
+            }
+            for item in view.history
+        ],
+        "events": [
+            {"at": event.at.isoformat(timespec="seconds"), "kind": event.kind, "text": event.text}
+            for event in view.events
+        ],
+    }
+
+
 class Controller:
     def __init__(
         self,

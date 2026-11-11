@@ -1,15 +1,24 @@
-"""Командная строка Nightfall: `python3 nightfall.py [--gui|--headless|--plan]`."""
+"""Командная строка Nightfall.
+
+    python3 nightfall.py                 окно (фоновая служба поднимется сама)
+    python3 nightfall.py --service       фоновая служба без окна (для systemd)
+    python3 nightfall.py --status        что запланировано
+    python3 nightfall.py --postpone 15   отложить выключение
+    python3 nightfall.py --stop          остановить фоновую службу
+"""
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
-import time
-from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Optional
 
-from . import schedule
-from .controller import Controller
+from . import ipc, notify
+from .client import DaemonClient, RemoteView, view_from_dict
+from datetime import timedelta
+
 from .schedule import fmt_hm, human_delta
 from .storage import Store, export_history
 
@@ -23,35 +32,58 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "примеры:\n"
-            "  python3 nightfall.py                 # открыть окно\n"
-            "  python3 nightfall.py --real          # боевой режим (реально выключать)\n"
-            "  python3 nightfall.py --headless      # без окна, только уведомления\n"
-            "  python3 nightfall.py --plan          # показать план и выйти\n"
-            "  python3 nightfall.py --reset         # сбросить прогресс\n"
+            "  python3 nightfall.py                  # окно (фон уже работает)\n"
+            "  python3 nightfall.py --service        # фоновая служба без окна\n"
+            "  python3 nightfall.py --status         # что запланировано\n"
+            "  python3 nightfall.py --postpone 15    # отложить на 15 минут\n"
+            "  python3 nightfall.py --real           # реальное выключение вместо имитации\n"
+            "  python3 nightfall.py --stop           # остановить фон\n"
         ),
     )
     parser.add_argument("--state", type=Path, default=None, help="путь к файлу состояния")
-    parser.add_argument("--headless", action="store_true", help="работать без графического окна")
-    parser.add_argument("--plan", action="store_true", help="напечатать план и выйти")
-    parser.add_argument("--reset", action="store_true", help="сбросить прогресс (история -> .bak)")
-    parser.add_argument("--real", action="store_true", help="выключать компьютер по-настоящему")
-    parser.add_argument("--dry-run", action="store_true", help="только имитация выключения (по умолчанию)")
-    parser.add_argument("--shift", type=int, default=None, metavar="МИН",
-                        help="служебное: сдвинуть план текущей ночи на N минут раньше "
-                             "(чтобы проверить уведомления, не дожидаясь ночи)")
+    parser.add_argument("--socket", type=Path, default=None, help="путь к сокету демона")
+
+    mode = parser.add_argument_group("режим запуска")
+    mode.add_argument("--service", "--headless", dest="service", action="store_true",
+                      help="запустить фоновую службу (без окна)")
+    mode.add_argument("--popup-json", default=None, metavar="JSON",
+                      help="служебное: показать всплывающее напоминание и выйти")
+
+    actions = parser.add_argument_group("управление работающей службой")
+    actions.add_argument("--status", action="store_true", help="показать план и историю")
+    actions.add_argument("--plan", action="store_true", help="то же, что --status")
+    actions.add_argument("--postpone", nargs="?", type=int, const=0, default=None,
+                         metavar="МИН", help="отложить выключение (без числа — из настроек)")
+    actions.add_argument("--undo-postpone", action="store_true", help="отменить последний перенос")
+    actions.add_argument("--shutdown-now", action="store_true", help="выключить компьютер сейчас")
+    actions.add_argument("--stop", action="store_true", help="остановить фоновую службу")
+    actions.add_argument("--real", action="store_true", help="реальное выключение вместо имитации")
+    actions.add_argument("--dry-run", action="store_true", help="вернуть режим имитации")
+    actions.add_argument("--reset", action="store_true", help="сбросить прогресс (история -> .bak)")
+    actions.add_argument("--shift", type=int, default=None, metavar="МИН",
+                         help="служебное: сдвинуть план текущей ночи на N минут раньше")
     return parser
 
 
-def _print_plan(controller: Controller) -> None:
-    view = controller.view()
-    night = view.night
+# --------------------------------------------------------------------------- #
+#  Печать состояния
+# --------------------------------------------------------------------------- #
+def _offline_view(store: Store) -> RemoteView:
+    from .controller import Controller, view_to_dict
+
+    controller = Controller(store, desktop_notifications=False)
+    return view_from_dict(view_to_dict(controller.view()))
+
+
+def _print_view(view: RemoteView, source: str) -> None:
     print(BANNER)
     print("=" * len(BANNER))
+    print(f"источник          : {source}")
     print(f"сейчас            : {view.now:%d.%m %H:%M}")
-    print(f"ночь (вечер)      : {night.evening:%d.%m.%Y}")
-    print(f"план              : {fmt_hm(night.target)}")
-    print(f"перенесено        : +{night.postponed_minutes} мин")
-    print(f"фактически        : {fmt_hm(night.shutdown_at)}")
+    print(f"ночь (вечер)      : {view.night.evening:%d.%m.%Y}")
+    print(f"план              : {fmt_hm(view.night.target)}")
+    print(f"перенесено        : +{view.postponed} мин")
+    print(f"фактически        : {fmt_hm(view.night.shutdown_at)}")
     print(f"осталось          : {human_delta(view.remaining)}")
     print(f"цель              : {fmt_hm(view.settings.goal_time)}"
           f" (шаг {view.settings.step_minutes} мин)")
@@ -60,78 +92,210 @@ def _print_plan(controller: Controller) -> None:
           f"каждые {view.settings.warn_interval_minutes} мин")
     print(f"режим             : {'имитация' if view.settings.dry_run else 'реальное выключение'}")
     print(f"состояние         : {view.state_path}")
-    print()
-    print(export_history(controller.state))
 
 
-def run_headless(controller: Controller) -> int:
-    from . import notify
-
-    def on_reminder(night, reminder):
-        notify.log(f"напоминание: осталось {reminder.remaining_minutes} мин "
-                   f"до {fmt_hm(reminder.shutdown_at)}")
-
-    def on_shutdown(night, ok, message):
-        notify.log(f"выключение: {message}")
-
-    controller.on_reminder = on_reminder
-    controller.on_shutdown = on_shutdown
-    notify.log("запущен без окна, Ctrl+C для выхода")
-    notify.log(f"план: {fmt_hm(controller.view().night.shutdown_at)} "
-               f"({'имитация' if controller.state.settings.dry_run else 'реально'})")
+def command_status(store: Store, client: DaemonClient) -> int:
     try:
-        while True:
-            controller.tick()
-            time.sleep(15)
-    except KeyboardInterrupt:
-        notify.log("остановлено")
+        view = client.view()
+        source = f"фоновая служба, pid {client.pid}"
+        history = client.export_history()
+    except ipc.IpcError:
+        view = _offline_view(store)
+        source = "фон не запущен (данные из файла состояния)"
+        history = export_history(store.load())
+    _print_view(view, source)
+    print()
+    print(history)
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    store = Store(args.state) if args.state else Store()
+# --------------------------------------------------------------------------- #
+#  Управление
+# --------------------------------------------------------------------------- #
+def _offline_settings(store: Store) -> tuple[object, object]:
+    from .controller import Controller
 
-    if args.reset:
+    controller = Controller(store, desktop_notifications=False)
+    return controller, controller.state.settings
+
+
+def command_flag(
+    store: Store,
+    client: DaemonClient,
+    name: str,
+    *,
+    minutes: Optional[int] = None,
+    settings=None,
+) -> int:
+    """Команды, которые выполняет демон, с разумным офлайн-фолбэком."""
+    from . import schedule
+
+    try:
+        if name == "postpone":
+            client.postpone(minutes)
+            view = client.view()
+            print(f"отложено → выключение в {fmt_hm(view.night.shutdown_at)} (+{view.postponed} мин)")
+            return 0
+
+        if name == "undo":
+            client.undo_postpone()
+            view = client.view()
+            print(f"перенос отменён → выключение в {fmt_hm(view.night.shutdown_at)}")
+            return 0
+
+        if name == "shutdown-now":
+            client.shutdown_now()
+            print("команда выключения отправлена")
+            return 0
+
+        if name == "stop":
+            client.quit_daemon()
+            print("фоновая служба остановлена")
+            return 0
+
+        if name == "shift":
+            client.shift(minutes or 0)
+            view = client.view()
+            print(f"план сдвинут → {fmt_hm(view.night.shutdown_at)}")
+            return 0
+
+        if name == "settings":
+            client.apply_settings(settings)
+            return 0
+
+        if name == "reset":
+            client.reset_progress()
+            print("прогресс сброшен")
+            return 0
+    except ipc.IpcError:
+        pass  # демон не запущен — ниже делаем то же самое напрямую с файлом
+
+    # ---- офлайн-режим ------------------------------------------------ #
+    if name == "reset":
         store.reset()
-        print(f"Прогресс сброшен. Данные: {store.path}")
-
-    controller = Controller(store)
-    settings = controller.state.settings
-    changed = False
-    if args.real:
-        settings.dry_run = False
-        changed = True
-    if args.dry_run:
-        settings.dry_run = True
-        changed = True
-    if changed:
-        controller.apply_settings(settings)
-
-    if args.shift:
-        night = controller.state.nights[-1] if controller.state.nights else None
-        if night is not None:
-            night.target = night.target - timedelta(minutes=args.shift)
-            night.fired = []
-            controller.save()
-            print(f"План сдвинут на {args.shift} мин раньше -> {fmt_hm(night.shutdown_at)}")
-
-    if args.plan:
-        _print_plan(controller)
+        print(f"прогресс сброшен. Данные: {store.path}")
         return 0
 
-    if args.headless:
-        return run_headless(controller)
+    if name == "settings":
+        from .controller import Controller
 
+        controller = Controller(store, desktop_notifications=False)
+        controller.apply_settings(settings)
+        print("настройки сохранены (фон не запущен)")
+        return 0
+
+    from .controller import Controller
+
+    controller = Controller(store, desktop_notifications=False)
+    night = controller.state.nights[-1] if controller.state.nights else None
+    if night is None:
+        print("нет данных о ночах", file=sys.stderr)
+        return 1
+
+    if name == "postpone":
+        if night.settled:
+            print("эта ночь уже закрыта — переносить нечего", file=sys.stderr)
+            return 1
+        value = minutes or controller.state.settings.postpone_minutes
+        schedule.postpone(night, value, controller.clock())
+        controller.save()
+        print(f"перенесено на {value} мин → выключение в {fmt_hm(night.shutdown_at)} "
+              f"(фон не запущен, сохранено в файл)", file=sys.stderr)
+        return 0
+
+    if name == "undo":
+        schedule.undo_last_postpone(night)
+        controller.save()
+        print(f"перенос отменён → выключение в {fmt_hm(night.shutdown_at)} (фон не запущен)",
+              file=sys.stderr)
+        return 0
+
+    if name == "shift":
+        night.target = night.target - timedelta(minutes=minutes or 0)
+        night.fired = []
+        controller.save()
+        print(f"план сдвинут → {fmt_hm(night.shutdown_at)} (фон не запущен)", file=sys.stderr)
+        return 0
+
+    print("для этой команды нужна запущенная фоновая служба "
+          "(python3 nightfall.py --service)", file=sys.stderr)
+    return 1
+
+
+def run_service(store: Store, socket: Optional[Path]) -> int:
+    from .daemon import Daemon
+
+    daemon = Daemon(store, socket=socket)
+    return daemon.run()
+
+
+def run_window(client: DaemonClient) -> int:
+    if not client.ensure_daemon():
+        print("не удалось запустить фоновую службу — окно откроется в режиме «нет связи»",
+              file=sys.stderr)
     try:
         from .ui import run_gui
     except ImportError as error:  # pragma: no cover
         print("Не удалось загрузить tkinter:", error, file=sys.stderr)
         print("Установи пакет: sudo apt install python3-tk", file=sys.stderr)
+        print("Либо запусти без окна: python3 nightfall.py --service", file=sys.stderr)
         return 1
     try:
-        return run_gui(controller)
+        return run_gui(client)
     except Exception as error:  # pragma: no cover
         print("Ошибка графического интерфейса:", error, file=sys.stderr)
-        print("Запасной вариант: python3 nightfall.py --headless", file=sys.stderr)
         return 1
+
+
+def run_popup_process(payload: dict, socket: Optional[Path]) -> int:
+    from .ui import run_popup
+
+    client = DaemonClient(socket_path=socket)
+    return run_popup(payload, client)
+
+
+# --------------------------------------------------------------------------- #
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    store = Store(args.state) if args.state else Store()
+    client = DaemonClient(socket_path=args.socket, state_path=args.state)
+
+    if args.popup_json:
+        try:
+            payload = json.loads(args.popup_json)
+        except json.JSONDecodeError as error:
+            print(f"плохой JSON: {error}", file=sys.stderr)
+            return 2
+        return run_popup_process(payload, args.socket)
+
+    if args.service:
+        return run_service(store, args.socket)
+
+    if args.status or args.plan:
+        return command_status(store, client)
+
+    if args.real or args.dry_run:
+        value = bool(args.dry_run)  # при обоих флагах побеждает имитация
+        try:
+            client.set_dry_run(value)
+        except ipc.IpcError:
+            controller, settings = _offline_settings(store)
+            settings.dry_run = value
+            controller.apply_settings(settings)
+        print(f"режим: {'имитация' if value else 'реальное выключение'}")
+        return 0
+
+    if args.reset:
+        return command_flag(store, client, "reset")
+    if args.postpone is not None:
+        return command_flag(store, client, "postpone", minutes=args.postpone or None)
+    if args.undo_postpone:
+        return command_flag(store, client, "undo")
+    if args.shift is not None:
+        return command_flag(store, client, "shift", minutes=args.shift)
+    if args.shutdown_now:
+        return command_flag(store, client, "shutdown-now")
+    if args.stop:
+        return command_flag(store, client, "stop")
+
+    return run_window(client)
