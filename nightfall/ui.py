@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 from tkinter import font as tkfont, messagebox
 from typing import Callable, Optional
 
-from . import ipc, notify, schedule, session
+from . import ipc, schedule, session
 
 
 # Подсказки Motif (_MOTIF_WM_HINTS): какие действия и кнопки разрешает WM.
@@ -663,15 +663,7 @@ class NightfallWindow:
         """Спрятать окно, оставив иконку в трее (процесс продолжает жить)."""
         _dbg("hide_window")
         self.visible = False
-        self.root.withdraw()
-        if not getattr(self, "_hid_notice", False):
-            self._hid_notice = True
-            notify.desktop_notify(
-                "Nightfall свернулся в трей",
-                "Расписание работает. Иконка рядом с часами: клик — открыть, "
-                "правый клик — меню.",
-                timeout_ms=6000,
-            )
+        self.root.withdraw()  # тихо: иконка в трее и так показывает, что всё живо
 
     def on_close_request(self) -> None:
         """Крестик: при живой иконке в трее окно прячется, а не закрывается."""
