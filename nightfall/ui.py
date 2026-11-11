@@ -188,6 +188,8 @@ class CanvasSurface(tk.Frame):
         self.p = Painter(self.canvas, scale)
         self.buttons: list[HitButton] = []
         self.pointer: Optional[tuple[float, float]] = None
+        self._hover_key: Optional[tuple] = None
+        self._static_ids: frozenset[int] = frozenset()
         self.canvas.bind("<Button-1>", self._on_click)
         self.canvas.bind("<Motion>", self._on_motion)
         self.canvas.bind("<Leave>", self._on_leave)
@@ -208,20 +210,37 @@ class CanvasSurface(tk.Frame):
         self.pointer = (event.x / self.scale, event.y / self.scale)
         button = self._hit(*self.pointer)
         self.canvas.configure(cursor="hand2" if button else "")
-        self.redraw()
+        # Перерисовываем только когда поменялась кнопка под курсором:
+        # движение мыши по пустому месту не должно стоить кадра.
+        key = (button.x1, button.y1, button.x2, button.y2) if button else None
+        if key != self._hover_key:
+            self._hover_key = key
+            self.redraw()
 
     def _on_leave(self, _event) -> None:
         self.pointer = None
         self.canvas.configure(cursor="")
-        self.redraw()
+        if self._hover_key is not None:
+            self._hover_key = None
+            self.redraw()
 
     def redraw(self) -> None:
         pass
 
     # -- рисование -------------------------------------------------------- #
-    def begin(self) -> None:
-        self.canvas.delete("all")
+    def begin(self, keep_static: bool = False) -> None:
+        if keep_static and self._static_ids:
+            for item in self.canvas.find_all():
+                if item not in self._static_ids:
+                    self.canvas.delete(item)
+        else:
+            self.canvas.delete("all")
+            self._static_ids = frozenset()
         self.buttons.clear()
+
+    def protect_static(self) -> None:
+        """Запомнить текущие элементы как неподвижный фон (градиент, свечение)."""
+        self._static_ids = frozenset(self.canvas.find_all())
 
     def button(
         self,
@@ -290,6 +309,8 @@ class NightfallWindow:
         self.root.bind("<Control-comma>", lambda _e: self.open_settings())
         self.root.bind("<Control-q>", lambda _e: self.close())
         self.root.protocol("WM_DELETE_WINDOW", self.close)
+        # после разворачивания окна кадр мог устареть — рисуем заново
+        self.root.bind("<Map>", lambda _e: self.render())
 
         self.render()
         self.root.after(500, self.tick)
@@ -321,10 +342,46 @@ class NightfallWindow:
     def tick(self) -> None:
         try:
             self.view = self.ctrl.tick()
-            self.render()
+            if self._needs_render():
+                self.render()
         except Exception as error:  # pragma: no cover
             print("nightfall: ошибка кадра:", error)
         self.root.after(1000, self.tick)
+
+    def _needs_render(self) -> bool:
+        """Кадр нужен, только если изменилось то, что видно на экране.
+
+        Пока до выключения больше часа, счётчик показывает часы и минуты —
+        значит, достаточно перерисовывать окно раз в минуту, а не каждую секунду.
+        """
+        try:
+            if self.root.state() == "iconic":  # свернуто — не рисуем вообще
+                return False
+        except tk.TclError:  # pragma: no cover
+            pass
+        v = self.view
+        seconds = max(0.0, v.remaining.total_seconds())
+        quantum = 1 if seconds < 3600 else 60
+        key = (
+            int(seconds // quantum),
+            quantum,
+            v.phase,
+            v.postponed,
+            v.night.target,
+            v.night.actual,
+            v.night.skipped,
+            v.now.strftime("%H:%M"),
+            v.next_reminder_at,
+            v.at_goal,
+            len(v.events),
+            len(v.history),
+            v.settings,
+            v.settings.dry_run,
+        )
+        if key == getattr(self, "_frame_key", None):
+            return False
+        self._frame_key = key
+        return True
 
     # ------------------------------------------------------------------ #
     #  Действия
@@ -401,8 +458,11 @@ class NightfallWindow:
     # ------------------------------------------------------------------ #
     def render(self) -> None:
         s = self.surface
-        s.begin()
-        self._background()
+        first_paint = not s._static_ids
+        s.begin(keep_static=not first_paint)
+        if first_paint:
+            self._background()
+            s.protect_static()  # градиент и свечение больше не перерисовываем
         self._header()
         self._hero()
         self._chart()
