@@ -22,6 +22,32 @@ from typing import Callable, Optional
 from . import ipc, notify, schedule, session
 
 
+# Подсказки Motif (_MOTIF_WM_HINTS): какие действия и кнопки разрешает WM.
+# Важно: флаг ALL (0x1) означает «разрешить всё» и перекрывает остальные биты —
+# поэтому его быть НЕ должно, иначе «свернуть» и «развернуть» никуда не денутся.
+MWM_FUNC_RESIZE = 0x2
+MWM_FUNC_MOVE = 0x4
+MWM_FUNC_CLOSE = 0x20
+MWM_DECOR_BORDER = 0x2
+MWM_DECOR_RESIZEH = 0x4
+MWM_DECOR_TITLE = 0x8
+MWM_DECOR_MENU = 0x10
+
+
+def motif_hints_values() -> tuple[int, int, int]:
+    """(flags, functions, decorations): без рамки оконного менеджера.
+
+    Кнопки «свернуть»/«развернуть» рисует оконный менеджер, и убрать только их
+    он не даёт: подсказки Motif он понимает как «всё или ничего». Поэтому рамку
+    WM мы отключаем целиком (decorations = 0), а свой заголовок с единственным
+    крестиком рисуем сами — он всегда выглядит одинаково.
+    """
+    flags = 0x1 | 0x2  # MWM_HINTS_FUNCTIONS | MWM_HINTS_DECORATIONS
+    functions = MWM_FUNC_RESIZE | MWM_FUNC_MOVE | MWM_FUNC_CLOSE
+    decorations = 0  # без рамки: заголовок наш
+    return flags, functions, decorations
+
+
 def _close_button_only(root) -> None:
     """Оставить в заголовке окна только крестик.
 
@@ -102,12 +128,11 @@ def _close_button_only(root) -> None:
             current = ctypes.c_ulong(parent.value)
             targets.append(parent.value)
 
-        hints_functions, hints_decorations = 1, 2
-        func_all, func_resize, func_move, func_close = 0x1, 0x2, 0x4, 0x20
+        flags, functions, decorations = motif_hints_values()
         hints = MotifWmHints(
-            flags=hints_functions | hints_decorations,
-            functions=func_all | func_resize | func_move | func_close,  # без minimize/maximize
-            decorations=0x1,  # оформление как обычно, но без лишних кнопок
+            flags=flags,
+            functions=functions,
+            decorations=decorations,
             input_mode=0,
             status=0,
         )
@@ -156,6 +181,7 @@ C = {
 }
 
 DESIGN_W, DESIGN_H = 1020, 768
+WINDOW_BAR = 34  # своя полоска заголовка: перетаскивание окна и крестик
 
 
 # --------------------------------------------------------------------------- #
@@ -400,22 +426,35 @@ class NightfallWindow:
     def __init__(self, client: DaemonClient) -> None:
         self.ctrl = client
         self.root = tk.Tk()
-        self.root.title("Nightfall — плавное засыпание")
-        try:
-            # окно постоянного размера: сворачивать и разворачивать его незачем,
-            # поэтому просим WM оформить его как диалог — только с крестиком
-            self.root.attributes("-type", "dialog")
-        except tk.TclError:  # pragma: no cover - не X11
-            pass
+        # только латиница: в панели задач заголовок не должен ломаться
+        # из-за не-UTF8 локали оконного менеджера
+        self.root.title("Nightfall")
         self.root.configure(bg=C["bg0"])
         self.scale = self._detect_scale()
         self.fonts = Fonts(self.root, self.scale)
+        self._drag_origin: Optional[tuple[int, int, int, int]] = None
+
+        # своя полоска заголовка: рамку оконного менеджера мы отключаем, поэтому
+        # перетаскивание и крестик тоже свои (и никаких «свернуть»/«развернуть»)
+        self.bar_height = int(WINDOW_BAR * self.scale)
+        self.bar = tk.Canvas(
+            self.root, height=self.bar_height, bg=C["bg1"], highlightthickness=0, bd=0,
+        )
+        self.bar.pack(side="top", fill="x")
+
         self.surface = CanvasSurface(self.root, DESIGN_W, DESIGN_H, self.scale, C["bg0"])
         self.surface.redraw = self.render
         # центр вместо растягивания: тайловые WM могут развернуть окно на весь экран
-        self.surface.place(relx=0.5, rely=0.5, anchor="center")
+        self.surface.place(relx=0.5, rely=0.0, anchor="n", y=self.bar_height)
         self.root.resizable(False, False)
         self._center_window()
+        self._draw_window_bar()
+        self.bar.bind("<Configure>", lambda _e: self._draw_window_bar())
+        self.bar.bind("<Button-1>", self._bar_press)
+        self.bar.bind("<B1-Motion>", self._bar_drag)
+        self.bar.bind("<ButtonRelease-1>", lambda _e: setattr(self, "_drag_origin", None))
+        self.bar.bind("<Motion>", self._bar_motion)
+        self.bar.bind("<Leave>", lambda _e: self._close_hover(False))
 
         # сокет окна: через него трей и `nightfall --show` будят свёрнутое окно
         self._commands: "queue.Queue[str]" = queue.Queue()
@@ -426,7 +465,6 @@ class NightfallWindow:
             self.gui_server = None
         self.tray_active = False
         self.visible = True  # окно на экране: этим пользуется клик по иконке
-        self._titlebar_fixed = False
 
         self.online = client.is_running()
         self.view: Optional[RemoteView] = client.last_view
@@ -454,15 +492,80 @@ class NightfallWindow:
         threading.Thread(target=self._start_tray, daemon=True).start()
 
     # ------------------------------------------------------------------ #
+    def _draw_window_bar(self) -> None:
+        """Своя полоска заголовка: луна, название и единственный крестик."""
+        canvas, scale = self.bar, self.scale
+        canvas.delete("all")
+        width = canvas.winfo_width()
+        if width <= 1:
+            width = int(DESIGN_W * scale)
+        height = self.bar_height
+        canvas.create_rectangle(0, 0, width, height, fill=C["bg1"], outline="")
+        canvas.create_line(0, height - 1, width, height - 1, fill=mix(C["bg1"], C["violet"], 0.25))
+
+        # полумесяц
+        canvas.create_oval(12 * scale, 9 * scale, 28 * scale, 25 * scale,
+                           fill=mix(C["bg1"], C["violet"], 0.35), outline="")
+        canvas.create_oval(15 * scale, 12 * scale, 27 * scale, 24 * scale,
+                           fill=C["violet2"], outline="")
+        canvas.create_oval(21 * scale, 8 * scale, 30 * scale, 19 * scale,
+                           fill=C["bg1"], outline="")
+        canvas.create_text(40 * scale, height / 2, text="Nightfall", anchor="w",
+                           fill=C["muted"], font=self.fonts.small)
+
+        # крестик: две линии рисуем сами — так он одинаков во всех темах
+        self.close_center = (width - 22 * scale, height / 2)
+        reach = 6 * scale
+        cx, cy = self.close_center
+        self.close_lines = [
+            canvas.create_line(cx - reach, cy - reach, cx + reach, cy + reach,
+                               fill=C["muted"], width=max(1, 2 * scale), capstyle="round"),
+            canvas.create_line(cx - reach, cy + reach, cx + reach, cy - reach,
+                               fill=C["muted"], width=max(1, 2 * scale), capstyle="round"),
+        ]
+
+    def _close_hover(self, active: bool) -> None:
+        color = C["red"] if active else C["muted"]
+        for item in getattr(self, "close_lines", []):
+            self.bar.itemconfigure(item, fill=color)
+
+    def _in_close_zone(self, x: int, y: int) -> bool:
+        cx, cy = getattr(self, "close_center", (0, 0))
+        radius = 13 * self.scale
+        return abs(x - cx) <= radius and abs(y - cy) <= radius
+
+    def _bar_motion(self, event) -> None:
+        self._close_hover(self._in_close_zone(event.x, event.y))
+        self.bar.configure(cursor="hand2" if self._in_close_zone(event.x, event.y) else "")
+
+    def _bar_press(self, event) -> None:
+        """Крестик — закрыть/спрятать; остальное — тянем окно (рамки WM нет)."""
+        if self._in_close_zone(event.x, event.y):
+            self.on_close_request()
+            return
+        self.root.focus_force()
+        self._drag_origin = (event.x_root, event.y_root,
+                             self.root.winfo_x(), self.root.winfo_y())
+
+    def _bar_drag(self, event) -> None:
+        if self._drag_origin is None:
+            return
+        x0, y0, win_x, win_y = self._drag_origin
+        self.root.geometry(f"+{win_x + event.x_root - x0}+{win_y + event.y_root - y0}")
+
     def _on_map(self, _event=None) -> None:
         self.render()
+        self._draw_window_bar()
         self._fix_titlebar()
 
     def _fix_titlebar(self) -> None:
-        if self._titlebar_fixed:
-            return
-        self._titlebar_fixed = True
+        # подсказки ставим каждый раз после появления окна: оконный менеджер
+        # может перечитать их при повторном управлении окном
         _close_button_only(self.root)
+        if os.environ.get("NIGHTFALL_DEBUG"):
+            flags, functions, decorations = motif_hints_values()
+            _dbg(f"заголовок: flags={flags:#x} functions={functions:#x} "
+                 f"decorations={decorations:#x}")
 
     def _detect_scale(self) -> float:
         try:
@@ -473,7 +576,7 @@ class NightfallWindow:
 
     def _center_window(self) -> None:
         width = int(DESIGN_W * self.scale)
-        height = int(DESIGN_H * self.scale)
+        height = int((DESIGN_H + WINDOW_BAR) * self.scale)
         x = max(0, (self.root.winfo_screenwidth() - width) // 2)
         y = max(0, (self.root.winfo_screenheight() - height) // 2 - 24)
         self.root.geometry(f"{width}x{height}+{x}+{y}")
@@ -516,6 +619,7 @@ class NightfallWindow:
     def show_window(self) -> None:
         self.visible = True
         self.root.deiconify()
+        self._draw_window_bar()
         self.root.lift()
         try:
             self.root.focus_force()
