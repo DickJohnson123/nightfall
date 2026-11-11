@@ -182,6 +182,20 @@ C = {
 
 DESIGN_W, DESIGN_H = 1020, 768
 WINDOW_BAR = 34  # своя полоска заголовка: перетаскивание окна и крестик
+MIN_SCALE = 0.55  # мельче делать нельзя: интерфейс перестанет читаться
+SCREEN_MARGIN_X = 32   # поля по краям экрана
+SCREEN_MARGIN_Y = 72   # место под панели: трей сверху, док снизу
+
+
+def fit_scale(dpi_scale: float, screen_w: int, screen_h: int) -> float:
+    """Масштаб, при котором окно целиком влезает в экран.
+
+    Системный масштаб (DPI) — это пожелание, а экран — ограничение: на 1366x768
+    окно в 1060x834 не помещается, и нижняя часть уезжала за край.
+    """
+    fit_width = (screen_w - SCREEN_MARGIN_X) / DESIGN_W
+    fit_height = (screen_h - SCREEN_MARGIN_Y) / (DESIGN_H + WINDOW_BAR)
+    return max(MIN_SCALE, min(dpi_scale, fit_width, fit_height))
 
 
 # --------------------------------------------------------------------------- #
@@ -266,10 +280,12 @@ class Fonts:
         k = scale
 
         def f(size: int, weight: str = "normal") -> tkfont.Font:
-            return tkfont.Font(root=root, family=self.sans, size=-int(size * k), weight=weight)
+            return tkfont.Font(root=root, family=self.sans,
+                               size=-max(6, int(size * k)), weight=weight)
 
         def m(size: int, weight: str = "normal") -> tkfont.Font:
-            return tkfont.Font(root=root, family=self.mono, size=-int(size * k), weight=weight)
+            return tkfont.Font(root=root, family=self.mono,
+                               size=-max(6, int(size * k)), weight=weight)
 
         self.title = f(22, "bold")
         self.subtitle = f(11)
@@ -568,17 +584,32 @@ class NightfallWindow:
                  f"decorations={decorations:#x}")
 
     def _detect_scale(self) -> float:
+        """Масштаб интерфейса: системный DPI, но окно обязано влезть в экран."""
+        forced = os.environ.get("NIGHTFALL_SCALE", "").strip()
+        if forced:
+            try:
+                return max(MIN_SCALE, min(1.6, float(forced)))
+            except ValueError:
+                pass
+        scale = 1.0
         try:
             dpi = self.root.winfo_fpixels("1i")
-            return max(1.0, min(1.6, round(dpi / 96.0, 2)))
+            scale = max(1.0, min(1.6, round(dpi / 96.0, 2)))
         except tk.TclError:  # pragma: no cover
-            return 1.0
+            pass
+        try:
+            return fit_scale(scale, self.root.winfo_screenwidth(), self.root.winfo_screenheight())
+        except tk.TclError:  # pragma: no cover
+            return scale
 
     def _center_window(self) -> None:
         width = int(DESIGN_W * self.scale)
         height = int((DESIGN_H + WINDOW_BAR) * self.scale)
-        x = max(0, (self.root.winfo_screenwidth() - width) // 2)
-        y = max(0, (self.root.winfo_screenheight() - height) // 2 - 24)
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        x = max(0, (screen_w - width) // 2)
+        # не заезжаем под панель сверху и не уходим за нижний край экрана
+        y = max(0, min((screen_h - height) // 2, screen_h - height - 8))
         self.root.geometry(f"{width}x{height}+{x}+{y}")
 
     # -- трей и управление окном ---------------------------------------- #

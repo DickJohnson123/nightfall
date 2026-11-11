@@ -55,3 +55,36 @@ class MotifHintsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FitScaleTest(unittest.TestCase):
+    """Окно должно целиком влезать в экран, иначе обрезается нижняя часть."""
+
+    def test_common_screens(self) -> None:
+        from nightfall.ui import DESIGN_H, DESIGN_W, MIN_SCALE, WINDOW_BAR, fit_scale
+
+        cases = [
+            (1.0, 1920, 1080, 1.0),      # FullHD, обычный DPI — как задумано
+            (1.0, 1366, 768, 0.867),     # ноутбук: окно уменьшается
+            (1.5, 1920, 1080, 1.257),    # HiDPI, но экран не резиновый
+            (1.0, 1024, 600, 0.658),     # совсем небольшой экран
+        ]
+        for dpi_scale, width, height, expected in cases:
+            with self.subTest(screen=(width, height), dpi=dpi_scale):
+                self.assertAlmostEqual(fit_scale(dpi_scale, width, height), expected, places=2)
+
+        # даже на крошечном экране масштаб не уходит ниже разумного предела
+        self.assertEqual(fit_scale(1.0, 800, 480), MIN_SCALE)
+
+    def test_window_never_exceeds_screen_unless_at_minimum(self) -> None:
+        from nightfall.ui import (DESIGN_H, DESIGN_W, MIN_SCALE, SCREEN_MARGIN_X,
+                                  SCREEN_MARGIN_Y, WINDOW_BAR, fit_scale)
+
+        for width, height in ((1920, 1080), (1440, 900), (1366, 768), (1280, 1024), (1024, 600)):
+            for dpi_scale in (1.0, 1.25, 1.5, 1.6):
+                with self.subTest(screen=(width, height), dpi=dpi_scale):
+                    scale = fit_scale(dpi_scale, width, height)
+                    self.assertLessEqual(DESIGN_W * scale, width - SCREEN_MARGIN_X + 0.001)
+                    self.assertLessEqual((DESIGN_H + WINDOW_BAR) * scale,
+                                         height - SCREEN_MARGIN_Y + 0.001)
+                    self.assertGreaterEqual(scale, MIN_SCALE)
