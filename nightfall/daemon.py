@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import fcntl
+import importlib.util
 import json
 import os
 import subprocess
@@ -31,6 +32,18 @@ def launcher_path() -> Optional[Path]:
     return candidate if candidate.exists() else None
 
 
+POPUPS_OFF = ("0", "off", "no", "none", "нет")
+
+
+def popups_available() -> bool:
+    """Можно ли нарисовать красивое напоминание внизу экрана."""
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return False
+    if importlib.util.find_spec("tkinter") is None:
+        return False
+    return launcher_path() is not None
+
+
 class Daemon:
     def __init__(
         self,
@@ -42,16 +55,19 @@ class Daemon:
     ) -> None:
         self.store = store or Store()
         self.socket_path = Path(socket) if socket else ipc.socket_path()
+        if popups is None:
+            forced = os.environ.get("NIGHTFALL_POPUPS", "").strip().lower()
+            popups = popups_available() and forced not in POPUPS_OFF
+        self.popups_enabled = popups
+        # Один канал на одно событие: если есть красивое напоминание внизу экрана,
+        # системному «пузырю» вверху делать нечего — он был его дублем.
         self.controller = Controller(
             self.store,
-            desktop_notifications=True,
+            desktop_notifications=not popups,
             **({"clock": clock} if clock else {}),
         )
         self.controller.on_reminder = self._on_reminder
         self.controller.on_shutdown = self._on_shutdown
-        if popups is None:
-            popups = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
-        self.popups_enabled = popups
         self.server = ipc.Server(self.handle_command, path=self.socket_path)
         self._stop = threading.Event()
         self._popup_process: Optional[subprocess.Popen] = None
@@ -229,11 +245,23 @@ class Daemon:
         self._popup_process = None
 
     def _spawn_popup(self, payload: dict) -> None:
-        if not self.popups_enabled:
+        """Показать напоминание ровно один раз, каким получится.
+
+        Основной канал — карточка внизу экрана. Если её показать нечем, а
+        системных уведомлений контроллер ещё не слал, говорим через систему:
+        так событие не потеряется и не задвоится.
+        """
+        if self._start_popup(payload):
             return
+        if not self.controller.desktop_notifications:
+            self._system_notify(payload)
+
+    def _start_popup(self, payload: dict) -> bool:
+        if not self.popups_enabled:
+            return False
         script = launcher_path()
         if script is None:
-            return
+            return False
         self._close_popup()
         args = [sys.executable, str(script), "--popup-json", json.dumps(payload)]
         if self.socket_path != ipc.socket_path():
@@ -247,3 +275,14 @@ class Daemon:
             )
         except OSError as error:
             notify.log(f"не удалось показать окно-напоминание: {error}")
+            return False
+        return True
+
+    def _system_notify(self, payload: dict) -> None:
+        """Запасной канал: системное уведомление. Основной — окно внизу экрана."""
+        title = str(payload.get("title") or "Nightfall")
+        body = " ".join(
+            str(part) for part in (payload.get("line1"), payload.get("line2")) if part
+        )
+        urgent = payload.get("kind") == "shutdown"
+        notify.desktop_notify(title, body, urgency="critical" if urgent else "normal")

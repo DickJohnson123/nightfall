@@ -1,11 +1,13 @@
 """Тесты фоновой службы и связи с ней по Unix-сокету."""
 
+import os
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from nightfall import ipc
+from nightfall import ipc, notify
 from nightfall.client import DaemonClient, view_from_dict
 from nightfall.controller import Controller, view_to_dict
 from nightfall.daemon import Daemon
@@ -161,3 +163,78 @@ class OfflineFallbackTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NotificationChannelTest(unittest.TestCase):
+    """Одно событие — одно уведомление: красивое внизу, а не два сразу."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "state.json")
+        self.socket = Path(self.tmp.name) / "night.sock"
+        self.payload = {
+            "kind": "reminder",
+            "title": "Осталось 15 мин",
+            "line1": "Выключение в 23:00",
+            "line2": "Успевай закрыть дела.",
+        }
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def daemon(self, **kwargs) -> Daemon:
+        return Daemon(self.store, socket=self.socket, clock=lambda: dt("2026-11-11 19:00"), **kwargs)
+
+    def test_popup_replaces_system_bubble(self):
+        daemon = self.daemon(popups=True)
+        self.assertFalse(daemon.controller.desktop_notifications)
+
+    def test_without_display_system_bubble_stays(self):
+        daemon = self.daemon(popups=False)
+        self.assertTrue(daemon.controller.desktop_notifications)
+
+    def test_reminder_does_not_ring_twice(self):
+        daemon = self.daemon(popups=True)
+        with mock.patch.object(notify, "desktop_notify") as bubble, \
+                mock.patch.object(daemon, "_start_popup", return_value=True) as popup:
+            daemon._on_reminder(mock.Mock(postponed_minutes=0), mock.Mock(
+                remaining_minutes=15, shutdown_at=dt("2026-11-11 23:00")))
+        popup.assert_called_once()
+        bubble.assert_not_called()
+
+    def test_broken_popup_falls_back_to_system(self):
+        daemon = self.daemon(popups=True)
+        with mock.patch.object(notify, "desktop_notify") as bubble, \
+                mock.patch("subprocess.Popen", side_effect=OSError("нет дисплея")):
+            daemon._spawn_popup(self.payload)
+        bubble.assert_called_once()
+        title, body = bubble.call_args[0]
+        self.assertEqual(title, "Осталось 15 мин")
+        self.assertIn("23:00", body)
+
+    def test_no_popup_without_launcher(self):
+        daemon = self.daemon(popups=True)
+        with mock.patch.object(notify, "desktop_notify") as bubble, \
+                mock.patch("nightfall.daemon.launcher_path", return_value=None):
+            daemon._spawn_popup(self.payload)
+        bubble.assert_called_once()
+
+    def test_disabled_popups_do_not_ring_again(self):
+        """Нет карточки — контроллер уже сказал сам: второй раз не повторяем."""
+        daemon = self.daemon(popups=False)
+        with mock.patch.object(daemon, "_system_notify") as bubble:
+            daemon._spawn_popup(self.payload)
+        bubble.assert_not_called()
+
+    def test_popups_can_be_turned_off_by_env(self):
+        with mock.patch.dict(os.environ, {"NIGHTFALL_POPUPS": "0", "DISPLAY": ":99"}):
+            daemon = self.daemon()
+        self.assertFalse(daemon.popups_enabled)
+        self.assertTrue(daemon.controller.desktop_notifications)
+
+    def test_headless_start_uses_system_bubbles(self):
+        env = {k: v for k, v in os.environ.items() if k not in ("DISPLAY", "WAYLAND_DISPLAY")}
+        with mock.patch.dict(os.environ, env, clear=True):
+            daemon = self.daemon()
+        self.assertFalse(daemon.popups_enabled)
+        self.assertTrue(daemon.controller.desktop_notifications)
