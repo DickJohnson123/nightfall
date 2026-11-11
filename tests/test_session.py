@@ -38,6 +38,13 @@ class PathsTest(unittest.TestCase):
         self.assertIn("--service", argv)
         self.assertEqual(argv[-4:], ["--state", "/tmp/y/s.json", "--socket", "/tmp/y/n.sock"])
 
+    def test_spawn_gui_asks_for_window_explicitly(self) -> None:
+        with mock.patch.object(subprocess, "Popen") as popen:
+            self.assertTrue(session.spawn_gui())
+        argv = popen.call_args[0][0]
+        # без --window процесс поднимет только иконку и тихо завершится
+        self.assertIn("--window", argv)
+
     def test_make_client_uses_same_paths(self) -> None:
         session.configure("/tmp/z/s.json", "/tmp/z/n.sock")
         client = session.make_client()

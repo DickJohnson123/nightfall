@@ -151,7 +151,9 @@ def spawn(args: list[str], *, interpreter: Optional[str] = None) -> bool:
 
 
 def spawn_gui() -> bool:
-    return spawn([])
+    # именно --window: обычный запуск теперь поднимает только иконку в трее,
+    # и без флага клик по иконке приводил бы к процессу без окна
+    return spawn(["--window"])
 
 
 def _candidate_interpreters() -> list[str]:
