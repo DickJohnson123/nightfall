@@ -33,6 +33,7 @@ echo "→ Устанавливаю в $DEST"
 mkdir -p "$DEST" "$BIN"
 rm -rf "$DEST/nightfall"
 cp -r "$SRC/nightfall" "$DEST/"
+cp -r "$SRC/assets" "$DEST/"   # иконка для трея
 cp "$SRC/nightfall.py" "$DEST/"
 chmod +x "$DEST/nightfall.py"
 

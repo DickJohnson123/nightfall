@@ -8,14 +8,24 @@
 from __future__ import annotations
 
 import math
+import os
+import queue
 import shlex
+import sys
+import threading
 import tkinter as tk
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from tkinter import font as tkfont, messagebox
 from typing import Callable, Optional
 
-from . import ipc, schedule
+from . import ipc, notify, schedule, session
+
+
+def _dbg(message: str) -> None:
+    """Отладка запуска/скрытия окна: NIGHTFALL_DEBUG=1 python3 nightfall.py"""
+    if os.environ.get("NIGHTFALL_DEBUG"):
+        print(f"[ui] {message}", file=sys.stderr, flush=True)
 from .client import DaemonClient, RemoteView
 from .schedule import Settings, fmt_hm, human_delta
 
@@ -299,6 +309,15 @@ class NightfallWindow:
         self.root.resizable(False, False)
         self._center_window()
 
+        # сокет окна: через него трей и `nightfall --show` будят свёрнутое окно
+        self._commands: "queue.Queue[str]" = queue.Queue()
+        self.gui_server = ipc.Server(self._handle_command, path=session.gui_socket())
+        try:
+            self.gui_server.listen()
+        except OSError:
+            self.gui_server = None
+        self.tray_active = False
+
         self.online = client.is_running()
         self.view: Optional[RemoteView] = client.last_view
         if self.view is None:
@@ -311,13 +330,16 @@ class NightfallWindow:
         self.root.bind("<Control-p>", lambda _e: self.ctrl.postpone())
         self.root.bind("<Control-P>", lambda _e: self.ctrl.postpone(30))
         self.root.bind("<Control-comma>", lambda _e: self.open_settings())
-        self.root.bind("<Control-q>", lambda _e: self.close())
-        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.root.bind("<Control-q>", lambda _e: self.on_close_request())
+        self.root.bind("<Control-h>", lambda _e: self.hide_window())
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close_request)
         # после разворачивания окна кадр мог устареть — рисуем заново
         self.root.bind("<Map>", lambda _e: self.render())
 
         self.render()
         self.root.after(500, self.tick)
+        self.root.after(150, self._pump_commands)
+        threading.Thread(target=self._start_tray, daemon=True).start()
 
     # ------------------------------------------------------------------ #
     def _detect_scale(self) -> float:
@@ -334,8 +356,72 @@ class NightfallWindow:
         y = max(0, (self.root.winfo_screenheight() - height) // 2 - 24)
         self.root.geometry(f"{width}x{height}+{x}+{y}")
 
+    # -- трей и управление окном ---------------------------------------- #
+    def _start_tray(self) -> None:
+        self.tray_active = session.ensure_tray()
+        _dbg(f"ensure_tray -> {self.tray_active}")
+        if self.tray_active:
+            self._frame_key = None  # перерисовать подсказку в настройках
+
+    def _handle_command(self, payload: dict) -> dict:
+        cmd = str(payload.get("cmd", ""))
+        if cmd == "ping":
+            return {"ok": True, "pid": os.getpid()}
+        if cmd in ("show", "hide", "quit"):
+            self._commands.put(cmd)
+            return {"ok": True, "pid": os.getpid()}
+        return {"ok": False, "error": f"неизвестная команда: {cmd}"}
+
+    def _pump_commands(self) -> None:
+        """Команды из трея приходят из другого потока — забираем их здесь."""
+        try:
+            while True:
+                cmd = self._commands.get_nowait()
+                if cmd == "show":
+                    self.show_window()
+                elif cmd == "hide":
+                    self.hide_window()
+                elif cmd == "quit":
+                    self.close()
+        except queue.Empty:
+            pass
+        self.root.after(150, self._pump_commands)
+
+    def show_window(self) -> None:
+        self.root.deiconify()
+        self.root.lift()
+        try:
+            self.root.focus_force()
+        except tk.TclError:  # pragma: no cover
+            pass
+        self._frame_key = None
+        self.render()
+
+    def hide_window(self) -> None:
+        """Спрятать окно, оставив иконку в трее (процесс продолжает жить)."""
+        _dbg("hide_window")
+        self.root.withdraw()
+        if not getattr(self, "_hid_notice", False):
+            self._hid_notice = True
+            notify.desktop_notify(
+                "Nightfall свернулся в трей",
+                "Расписание работает. Иконка рядом с часами: клик — открыть, "
+                "правый клик — меню.",
+                timeout_ms=6000,
+            )
+
+    def on_close_request(self) -> None:
+        """Крестик: при живой иконке в трее окно прячется, а не закрывается."""
+        _dbg(f"close_request tray_active={self.tray_active}")
+        if self.tray_active:
+            self.hide_window()
+        else:
+            self.close()
+
     def close(self) -> None:
-        """Закрыть окно. Демон продолжает работать — расписание не останавливается."""
+        """Полный выход из окна. Служба продолжает работать."""
+        if self.gui_server is not None:
+            self.gui_server.stop()
         self.root.destroy()
 
     def restart_daemon(self) -> None:
@@ -759,11 +845,10 @@ class NightfallWindow:
         if len(event) > 78:
             event = event[:75] + "…"
         p.text(32, 744, f"журнал: {event}", f.small, C["faint"], anchor="w")
-        p.text(
-            DESIGN_W - 32, 744,
-            "Ctrl+P — +15 мин  ·  Ctrl+Shift+P — +30 мин  ·  Ctrl+, — настройки",
-            f.small, C["faint"], anchor="e",
-        )
+        hint = "Ctrl+P — +15 мин  ·  Ctrl+Shift+P — +30 мин  ·  Ctrl+, — настройки"
+        if getattr(self, "tray_active", False):
+            hint += "  ·  Ctrl+H — в трей"
+        p.text(DESIGN_W - 32, 744, hint, f.small, C["faint"], anchor="e")
 
 
 # --------------------------------------------------------------------------- #
@@ -1079,6 +1164,10 @@ def run_popup(payload: dict, client: DaemonClient, scale: Optional[float] = None
 
 
 def run_gui(client: DaemonClient) -> int:
+    # Окно в единственном экземпляре: повторный запуск просто показывает старое.
+    if session.gui_running():
+        session.show_window()
+        return 0
     window = NightfallWindow(client)
     window.run()
     return 0

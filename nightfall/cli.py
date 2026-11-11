@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from . import ipc, notify
+from . import ipc, notify, session
 from .client import DaemonClient, RemoteView, view_from_dict
 from datetime import timedelta
 
@@ -48,6 +48,11 @@ def build_parser() -> argparse.ArgumentParser:
                       help="запустить фоновую службу (без окна)")
     mode.add_argument("--popup-json", default=None, metavar="JSON",
                       help="служебное: показать всплывающее напоминание и выйти")
+    mode.add_argument("--tray", action="store_true",
+                      help="иконка в системном трее (рядом с часами)")
+    mode.add_argument("--tray-backend", default="auto",
+                      choices=["auto", "appindicator", "statusicon", "yad", "detect", "probe"],
+                      help="какой бэкенд трея использовать (detect/probe — напечатать и выйти)")
 
     actions = parser.add_argument_group("управление работающей службой")
     actions.add_argument("--status", action="store_true", help="показать план и историю")
@@ -57,6 +62,10 @@ def build_parser() -> argparse.ArgumentParser:
     actions.add_argument("--undo-postpone", action="store_true", help="отменить последний перенос")
     actions.add_argument("--shutdown-now", action="store_true", help="выключить компьютер сейчас")
     actions.add_argument("--stop", action="store_true", help="остановить фоновую службу")
+    actions.add_argument("--show", action="store_true", help="показать окно")
+    actions.add_argument("--hide", action="store_true", help="спрятать окно в трей")
+    actions.add_argument("--quit", action="store_true",
+                         help="остановить окно, трей и службу")
     actions.add_argument("--real", action="store_true", help="реальное выключение вместо имитации")
     actions.add_argument("--dry-run", action="store_true", help="вернуть режим имитации")
     actions.add_argument("--reset", action="store_true", help="сбросить прогресс (история -> .bak)")
@@ -257,6 +266,8 @@ def run_popup_process(payload: dict, socket: Optional[Path]) -> int:
 # --------------------------------------------------------------------------- #
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    # окно, трей и служба должны смотреть в один и тот же state.json/сокет
+    session.configure(args.state, args.socket)
     store = Store(args.state) if args.state else Store()
     client = DaemonClient(socket_path=args.socket, state_path=args.state)
 
@@ -267,6 +278,37 @@ def main(argv: list[str] | None = None) -> int:
             print(f"плохой JSON: {error}", file=sys.stderr)
             return 2
         return run_popup_process(payload, args.socket)
+
+    if args.tray_backend in ("detect", "probe"):
+        from . import tray
+
+        found = tray.available_backends()
+        if args.tray_backend == "detect":  # лучший бэкенд с учётом всех интерпретаторов
+            backend, _interpreter = session.detect_tray()
+            print(backend or "none")
+        else:  # probe: что есть в этом интерпретаторе (его читает session.detect_all)
+            print(" ".join(found))
+        return 0
+
+    if args.tray:
+        from . import tray
+
+        return tray.run(args.tray_backend)
+
+    if args.show:
+        ok = session.show_window()
+        print("окно показано" if ok else "не удалось открыть окно", file=sys.stderr)
+        return 0 if ok else 1
+
+    if args.hide:
+        ok = session.hide_window()
+        print("окно спрятано в трей" if ok else "окно не запущено", file=sys.stderr)
+        return 0 if ok else 1
+
+    if args.quit:
+        session.quit_everything(client)
+        print("окно, трей и служба остановлены")
+        return 0
 
     if args.service:
         return run_service(store, args.socket)
