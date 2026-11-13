@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
-from typing import Sequence
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, Sequence
 
 
 def notify_send_available() -> bool:
@@ -85,6 +88,45 @@ def run_command(command: Sequence[str], *, dry_run: bool = True) -> tuple[bool, 
     return True, text
 
 
+# --------------------------------------------------------------------------- #
+#  Журнал
+# --------------------------------------------------------------------------- #
+LOG_MAX_BYTES = 256 * 1024
+
+
+def log_path() -> Path:
+    """Куда писать журнал. Автозапуск не показывает stderr — иначе всё теряется."""
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(Path.home(), ".local", "state")
+    return Path(base) / "nightfall" / "nightfall.log"
+
+
+def _trim(path: Path) -> None:
+    try:
+        if path.stat().st_size <= LOG_MAX_BYTES:
+            return
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        path.write_text("\n".join(lines[len(lines) // 2:]) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
 def log(message: str) -> None:
-    """Простой stdout-лог для headless-режима."""
+    """Строка в stderr и в файл журнала: после автозапуска stderr никто не читает."""
     print(f"[nightfall] {message}", file=sys.stderr, flush=True)
+    try:
+        path = log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _trim(path)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {message}\n")
+    except OSError:
+        pass
+
+
+def tail_log(lines: int = 20) -> Optional[list[str]]:
+    """Последние строки журнала (None — журнала ещё нет)."""
+    try:
+        text = log_path().read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    return text.splitlines()[-lines:]

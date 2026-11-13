@@ -7,7 +7,7 @@ from unittest import mock
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from nightfall import ipc, notify
+from nightfall import ipc, notify, session
 from nightfall.client import DaemonClient, view_from_dict
 from nightfall.controller import Controller, view_to_dict
 from nightfall.daemon import Daemon
@@ -156,8 +156,9 @@ class OfflineFallbackTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.json")
-            Controller(store, desktop_notifications=False).tick(dt("2026-11-11 19:00"))
-            view = _offline_view(store)
+            clock = lambda: dt("2026-11-11 19:00")  # noqa: E731 - короткая заглушка часов
+            Controller(store, desktop_notifications=False, clock=clock).tick(clock())
+            view = _offline_view(store, clock=clock)
             self.assertEqual(view.night.evening.isoformat(), "2026-11-11")
 
 
@@ -238,3 +239,55 @@ class NotificationChannelTest(unittest.TestCase):
             daemon = self.daemon()
         self.assertFalse(daemon.popups_enabled)
         self.assertTrue(daemon.controller.desktop_notifications)
+
+
+class TraySupervisionTest(unittest.TestCase):
+    """Служба сама добивается, чтобы иконка появилась — автозапуск бывает ранним."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.daemon = Daemon(
+            Store(Path(self.tmp.name) / "state.json"),
+            socket=Path(self.tmp.name) / "night.sock",
+            popups=False,
+            clock=lambda: dt("2026-11-11 19:00"),
+        )
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_ready_icon_is_left_alone(self):
+        with mock.patch.object(session, "tray_running", return_value=True), \
+                mock.patch.object(session, "ensure_tray") as ensure:
+            self.assertTrue(self.daemon._ensure_tray_once())
+        ensure.assert_not_called()
+
+    def test_no_display_means_no_tray_attempt(self):
+        with mock.patch.object(session, "tray_running", return_value=False), \
+                mock.patch.object(session, "discover_display", return_value=None), \
+                mock.patch.object(session, "ensure_tray") as ensure:
+            self.assertFalse(self.daemon._ensure_tray_once())
+        ensure.assert_not_called()
+
+    def test_display_appeared_means_tray_started(self):
+        with mock.patch.object(session, "tray_running", return_value=False), \
+                mock.patch.object(session, "discover_display", return_value=":0"), \
+                mock.patch.object(session, "ensure_tray", return_value=True) as ensure:
+            self.assertTrue(self.daemon._ensure_tray_once())
+        ensure.assert_called_once_with()
+
+    def test_journal_gets_only_state_changes(self):
+        with mock.patch.object(session, "tray_running", return_value=False), \
+                mock.patch.object(session, "discover_display", return_value=":0"), \
+                mock.patch.object(session, "ensure_tray", return_value=False), \
+                mock.patch.object(notify, "log") as log:
+            self.daemon._ensure_tray_once()
+            self.daemon._ensure_tray_once()
+            self.daemon._ensure_tray_once()
+        self.assertEqual(log.call_count, 1)  # не спамим каждые 20 секунд
+
+    def test_supervision_can_be_switched_off(self):
+        with mock.patch.dict(os.environ, {"NIGHTFALL_TRAY": "0"}):
+            self.assertFalse(self.daemon.tray_supervision_enabled())
+            self.daemon.start_tray_watch()
+        self.assertIsNone(self.daemon._tray_thread)

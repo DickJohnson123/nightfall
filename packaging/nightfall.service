@@ -7,6 +7,9 @@ After=graphical-session.target
 Type=simple
 # Замените %h/.local/share/nightfall на свой путь, если ставили вручную.
 # Добавьте --real, чтобы компьютер действительно выключался.
+# Иконку в трее служба поднимает сама, как только появляется графическая
+# сессия — отдельный автозапуск ради иконки не нужен. Не нужно и не хочется:
+# NIGHTFALL_TRAY=0 в отдельной строке Environment=.
 ExecStart=/usr/bin/env python3 %h/.local/share/nightfall/nightfall.py --service
 Restart=always
 RestartSec=15

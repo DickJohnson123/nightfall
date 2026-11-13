@@ -5,7 +5,9 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import socket
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -292,9 +294,8 @@ class StartupTest(unittest.TestCase):
 
         with mock.patch.dict("os.environ", {"DISPLAY": ":0"}, clear=False):
             self.assertTrue(display_available())
-        env = {key: value for key, value in os.environ.items()
-               if key not in ("DISPLAY", "WAYLAND_DISPLAY")}
-        with mock.patch.dict("os.environ", env, clear=True):
+        # без дисплея не сдаёмся молча: cli спрашивает общий поиск
+        with mock.patch.object(session, "discover_display", return_value=None):
             self.assertFalse(display_available())
 
     def test_startup_without_tray_opens_window(self) -> None:
@@ -320,3 +321,67 @@ class StartupTest(unittest.TestCase):
             self.assertEqual(cli.run_startup(client, with_window=False), 0)
         run_window.assert_not_called()
         self.assertIn("иконка", output.getvalue())
+
+
+class DiscoverDisplayTest(unittest.TestCase):
+    """Автозапуск часто срабатывает раньше оконной сессии — дисплей ищем сами."""
+
+    def setUp(self) -> None:
+        self.env = mock.patch.dict("os.environ", {}, clear=False)
+        self.env.start()
+        for name in ("DISPLAY", "WAYLAND_DISPLAY"):
+            os.environ.pop(name, None)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.x11 = Path(self.tmp.name) / "X11"
+        self.x11.mkdir()
+
+    def tearDown(self) -> None:
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def _socket(self, path: Path) -> socket.socket:
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(path))
+        server.listen(1)
+        self.addCleanup(server.close)
+        return server
+
+    def test_inherited_display_is_kept(self) -> None:
+        os.environ["DISPLAY"] = ":7"
+        self.assertEqual(session.discover_display(self.x11), ":7")
+
+    def test_live_x_socket_is_found(self) -> None:
+        self._socket(self.x11 / "X0")
+        self.assertEqual(session.discover_display(self.x11), ":0")
+        self.assertEqual(os.environ["DISPLAY"], ":0")  # детям тоже достанется
+
+    def test_stale_socket_is_ignored(self) -> None:
+        (self.x11 / "X0").write_text("")  # файл остался от выключенного сервера
+        runtime = Path(self.tmp.name) / "empty"
+        runtime.mkdir()
+        with mock.patch.object(ipc, "runtime_dir", return_value=runtime):
+            self.assertIsNone(session.discover_display(self.x11))
+
+    def test_lowest_display_wins(self) -> None:
+        self._socket(self.x11 / "X1")
+        self._socket(self.x11 / "X0")
+        self.assertEqual(session.discover_display(self.x11), ":0")
+
+    def test_wayland_socket_is_found(self) -> None:
+        runtime = Path(self.tmp.name) / "run"
+        runtime.mkdir()
+        self._socket(runtime / "wayland-0")
+        with mock.patch.object(ipc, "runtime_dir", return_value=runtime):
+            self.assertEqual(session.discover_display(self.x11), "wayland-0")
+        self.assertEqual(os.environ["WAYLAND_DISPLAY"], "wayland-0")
+
+    def test_no_session_at_all(self) -> None:
+        with mock.patch.object(ipc, "runtime_dir", return_value=self.x11):
+            self.assertIsNone(session.discover_display(self.x11))
+
+    def test_display_available_uses_discovery(self) -> None:
+        # не полагаемся на реальный /tmp/.X11-unix машины, где гоняются тесты
+        with mock.patch.object(session, "discover_display", return_value=":0"):
+            self.assertTrue(session.display_available())
+        with mock.patch.object(session, "discover_display", return_value=None):
+            self.assertFalse(session.display_available())

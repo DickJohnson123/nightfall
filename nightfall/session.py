@@ -119,6 +119,54 @@ def quit_window() -> bool:
 # --------------------------------------------------------------------------- #
 #  Трей
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+#  Графическая сессия
+# --------------------------------------------------------------------------- #
+def _display_sort_key(path: Path) -> tuple[int, str]:
+    tail = path.name[1:]
+    return (int(tail) if tail.isdigit() else 999, path.name)
+
+
+def discover_display(x11_dir: Path | str = "/tmp/.X11-unix") -> Optional[str]:
+    """Найти графическую сессию, даже если DISPLAY не достался по наследству.
+
+    Автозапуск часто срабатывает раньше, чем оконная сессия выставит DISPLAY:
+    тогда программа решает, что графики нет, и молча работает без иконки.
+    Поэтому ищем сокет X-сервера сами и запоминаем найденное в ``os.environ`` —
+    дальше его унаследуют и окно, и иконка в трее.
+    """
+    current = os.environ.get("DISPLAY")
+    if current:
+        return current
+    wayland = os.environ.get("WAYLAND_DISPLAY")
+    if wayland:
+        return wayland
+    try:
+        sockets = sorted(Path(x11_dir).glob("X*"), key=_display_sort_key)
+    except OSError:
+        sockets = []
+    for socket in sockets:
+        if not ipc.socket_is_live(socket):
+            continue  # файл остался от выключенного X-сервера
+        display = f":{socket.name[1:]}"
+        os.environ["DISPLAY"] = display
+        return display
+    try:
+        wayland_sockets = sorted(ipc.runtime_dir().glob("wayland-*"))
+    except OSError:
+        wayland_sockets = []
+    for socket in wayland_sockets:
+        if not ipc.socket_is_live(socket):
+            continue
+        os.environ["WAYLAND_DISPLAY"] = socket.name
+        return socket.name
+    return None
+
+
+def display_available() -> bool:
+    return discover_display() is not None
+
+
 def tray_running() -> bool:
     try:
         return bool(ipc.request({"cmd": "ping"}, path=tray_socket(), timeout=1.0).get("ok"))

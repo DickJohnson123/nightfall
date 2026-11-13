@@ -21,8 +21,12 @@ class SimulationTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.path = Path(self.tmp.name) / "state.json"
         self.store = Store(self.path)
-        self.controller = Controller(self.store, desktop_notifications=False)
         self.now = dt("2026-11-11 19:00")
+        # часы подменяем: тесты про неделю не должны зависеть от того, какое
+        # сегодня число на машине, где их гоняют
+        self.controller = Controller(
+            self.store, desktop_notifications=False, clock=lambda: self.now
+        )
 
     def tearDown(self):
         self.tmp.cleanup()

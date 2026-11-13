@@ -77,16 +77,23 @@ def build_parser() -> argparse.ArgumentParser:
     actions.add_argument("--reset", action="store_true", help="сбросить прогресс (история -> .bak)")
     actions.add_argument("--shift", type=int, default=None, metavar="МИН",
                          help="служебное: сдвинуть план текущей ночи на N минут раньше")
+
+    diagnostics = parser.add_argument_group("диагностика")
+    diagnostics.add_argument("--doctor", action="store_true",
+                             help="показать, что видно про дисплей, трей и службу")
+    diagnostics.add_argument("--logs", nargs="?", type=int, const=20, default=None,
+                             metavar="N", help="последние N строк журнала (по умолчанию 20)")
     return parser
 
 
 # --------------------------------------------------------------------------- #
 #  Печать состояния
 # --------------------------------------------------------------------------- #
-def _offline_view(store: Store) -> RemoteView:
+def _offline_view(store: Store, clock=None) -> RemoteView:
     from .controller import Controller, view_to_dict
 
-    controller = Controller(store, desktop_notifications=False)
+    controller = Controller(store, desktop_notifications=False,
+                            **({"clock": clock} if clock else {}))
     return view_from_dict(view_to_dict(controller.view()))
 
 
@@ -245,8 +252,12 @@ def run_service(store: Store, socket: Optional[Path]) -> int:
 
 
 def display_available() -> bool:
-    """Есть ли графическая сессия (X11 или Wayland)."""
-    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    """Есть ли графическая сессия (X11 или Wayland).
+
+    Если DISPLAY не достался по наследству — например, автозапуск сработал
+    раньше оконной сессии — ищем сокет X-сервера сами, см. session.discover_display.
+    """
+    return session.display_available()
 
 
 def startup_plan(with_window: bool, tray_available: bool, has_display: bool = True) -> bool:
@@ -300,6 +311,59 @@ def run_window(client: DaemonClient) -> int:
         return 1
 
 
+def run_logs(count: int = 20) -> int:
+    lines = notify.tail_log(count)
+    if not lines:
+        print(f"журнала пока нет: {notify.log_path()}")
+        return 0
+    print(f"--- {notify.log_path()} (последние {len(lines)}) ---")
+    for line in lines:
+        print(line)
+    return 0
+
+
+def run_doctor() -> int:
+    """Что видно про дисплей, трей и службу. С этого стоит начинать разбор."""
+    from . import tray
+
+    print(BANNER)
+    print("=" * len(BANNER))
+    # сначала запоминаем, что досталось по наследству: discover_display()
+    # дописывает найденный дисплей в окружение
+    inherited = os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+    display = session.discover_display()
+    if display is None:
+        print("дисплей            : нет — программа работает в фоне, без окна и иконки")
+    else:
+        source = "из окружения" if inherited else "найден сам (автозапуск не успел)"
+        print(f"дисплей            : {display} ({source})")
+    try:
+        import tkinter  # noqa: F401,PLC0415
+
+        print("tkinter            : есть — окно и напоминания возможны")
+    except Exception as error:  # noqa: BLE001
+        print(f"tkinter            : нет ({error}) — окно и карточки недоступны")
+    found = session.detect_all()
+    if found:
+        pairs = ", ".join(f"{name} ({path})" for name, path in found.items())
+        print(f"бэкенды трея       : {pairs}")
+    else:
+        print("бэкенды трея       : ни одного (нужен python3-gi + gir1.2-gtk-3.0 или yad)")
+    print(f"иконка в трее      : {'работает' if session.tray_running() else 'нет'}")
+    print(f"сокет иконки       : {session.tray_socket()} "
+          f"({'живой' if ipc.socket_is_live(session.tray_socket()) else 'нет'})")
+    daemon_pid = ipc.daemon_pid()
+    print(f"служба             : {'pid ' + str(daemon_pid) if daemon_pid else 'не запущена'}")
+    print(f"файл состояния     : {session.state_path() or 'по умолчанию'}")
+    print(f"журнал             : {notify.log_path()}")
+    lines = notify.tail_log(5)
+    if lines:
+        print("последние записи   :")
+        for line in lines:
+            print(f"  {line}")
+    return 0
+
+
 def run_popup_process(payload: dict, socket: Optional[Path]) -> int:
     from .ui import run_popup
 
@@ -322,6 +386,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"плохой JSON: {error}", file=sys.stderr)
             return 2
         return run_popup_process(payload, args.socket)
+
+    if args.doctor:
+        return run_doctor()
+
+    if args.logs is not None:
+        return run_logs(args.logs)
 
     if args.tray_backend in ("detect", "probe"):
         from . import tray

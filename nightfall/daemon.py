@@ -18,12 +18,14 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Optional
 
-from . import ipc, notify, schedule
+from . import ipc, notify, schedule, session
 from .controller import Controller, view_to_dict
 from .schedule import Settings, fmt_hm
 from .storage import Store, export_history
 
 TICK_SECONDS = 15  # разрешение планировщика: напоминания идут с шагом 5 минут
+TRAY_RETRY_SECONDS = 20  # как часто служба проверяет, что иконка на месте
+TRAY_OFF = ("0", "off", "no", "none", "нет")
 
 
 def launcher_path() -> Optional[Path]:
@@ -70,6 +72,9 @@ class Daemon:
         self.controller.on_shutdown = self._on_shutdown
         self.server = ipc.Server(self.handle_command, path=self.socket_path)
         self._stop = threading.Event()
+        self._tray_stop = threading.Event()
+        self._tray_thread: Optional[threading.Thread] = None
+        self._tray_state: Optional[bool] = None
         self._popup_process: Optional[subprocess.Popen] = None
         self._lock_file = None
 
@@ -98,6 +103,7 @@ class Daemon:
         self.server.listen()
         ipc.pid_path().write_text(str(os.getpid()), encoding="utf-8")
         notify.log(f"демон запущен, сокет {self.socket_path}, pid {os.getpid()}")
+        self.start_tray_watch()
         view = self.controller.view()
         notify.log(
             f"план: {fmt_hm(view.night.shutdown_at)} "
@@ -117,6 +123,7 @@ class Daemon:
         return 0
 
     def _shutdown(self) -> None:
+        self._tray_stop.set()
         self.server.stop()
         self._close_popup()
         try:
@@ -231,6 +238,59 @@ class Daemon:
                 "autoclose": 15,
             }
         )
+
+    # ------------------------------------------------------------------ #
+    #  Надзор за иконкой в трее
+    # ------------------------------------------------------------------ #
+    def tray_supervision_enabled(self) -> bool:
+        forced = os.environ.get("NIGHTFALL_TRAY", "").strip().lower()
+        return forced not in TRAY_OFF
+
+    def start_tray_watch(self) -> None:
+        """Служба следит, чтобы иконка была на месте.
+
+        Автозапуск срабатывает раньше панели: DISPLAY ещё не выставлен, или
+        трея в системе пока нет. Раньше в этом случае иконка не появлялась
+        никогда — теперь служба повторяет попытку, пока не получится.
+        """
+        if self._tray_thread is not None or not self.tray_supervision_enabled():
+            return
+        self._tray_thread = threading.Thread(
+            target=self._tray_watch, name="nightfall-tray", daemon=True
+        )
+        self._tray_thread.start()
+
+    def _tray_watch(self) -> None:
+        while not self._tray_stop.is_set():
+            try:
+                self._ensure_tray_once()
+            except Exception as error:  # noqa: BLE001 - надзор не должен ронять службу
+                notify.log(f"иконка в трее: {error}")
+            self._tray_stop.wait(TRAY_RETRY_SECONDS)
+
+    def _ensure_tray_once(self) -> bool:
+        if session.tray_running():
+            return self._remember_tray(True)
+        display = session.discover_display()
+        if display is None:
+            return self._remember_tray(False, quiet=True)  # графики пока нет
+        ok = session.ensure_tray()
+        return self._remember_tray(ok, display=display)
+
+    def _remember_tray(self, ok: bool, *, display: Optional[str] = None,
+                       quiet: bool = False) -> bool:
+        """Пишем в журнал только смену состояния, чтобы не спамить каждые 20 с."""
+        if quiet and self._tray_state is False:
+            return ok
+        if ok != self._tray_state:
+            self._tray_state = ok
+            if ok:
+                where = f" (дисплей {display})" if display else ""
+                notify.log(f"иконка в трее поднята{where}")
+            else:
+                notify.log("иконки в трее нет — попробую снова через "
+                           f"{TRAY_RETRY_SECONDS} с")
+        return ok
 
     # ------------------------------------------------------------------ #
     #  Всплывающие окна (короткоживущий процесс на каждое напоминание)
