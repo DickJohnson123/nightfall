@@ -15,15 +15,17 @@
 
 from __future__ import annotations
 
+import json
 import shlex
 import shutil
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
-from . import ipc, session
+from . import ipc, notify, session
 
 ASSET = Path(__file__).resolve().parent.parent / "assets" / "nightfall.png"
 TITLE = "Nightfall"
@@ -115,13 +117,40 @@ def icon_path() -> str:
 # --------------------------------------------------------------------------- #
 #  Общие действия меню
 # --------------------------------------------------------------------------- #
+_last_failure = 0.0
+
+
+def _report_failure() -> None:
+    """Клик не сработал — сказать об этом карточкой, а не молчанием."""
+    global _last_failure
+    now = time.monotonic()
+    if now - _last_failure < 60:
+        return  # не спамим, если человек жмёт по иконке подряд
+    _last_failure = now
+    payload = {
+        "kind": "problem",
+        "title": "Окно не открылось",
+        "line1": "Иконка работает, а окно — нет. Часто это нехватка python3-tk.",
+        "line2": "Подробности: nightfall --logs 20",
+        "accent": "#FB7185",
+        "autoclose": 20,
+    }
+    session.spawn(["--popup-json", json.dumps(payload)])
+
+
 def _toggle() -> None:
     """Левый клик по иконке: окно открывается, если закрыто, и наоборот."""
-    session.toggle_window()
+    notify.log("клик по иконке: переключаю окно")
+    if not session.toggle_window():
+        notify.log("окно переключить не удалось — причина в записях выше")
+        _report_failure()
 
 
 def _show() -> None:
-    session.show_window()
+    notify.log("иконка: просят показать окно")
+    if not session.show_window():
+        notify.log("окно показать не удалось — причина в записях выше")
+        _report_failure()
 
 
 def _quit(client, stop_main) -> None:
@@ -337,6 +366,7 @@ def run(backend: Optional[str] = None) -> int:
     for name in chain:
         if session.tray_running():
             return 0  # иконка уже есть
+        notify.log(f"иконка в трее: бэкенд {name} ({sys.executable})")
         try:
             code = runners[name](client)
         except ipc.AlreadyRunning:

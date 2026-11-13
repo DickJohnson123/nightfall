@@ -1110,10 +1110,32 @@ class NightfallWindow:
 # --------------------------------------------------------------------------- #
 #  Всплывающее окно
 # --------------------------------------------------------------------------- #
+def wrap_text(font, text: str, width: int) -> list[str]:
+    """Разбить строку по словам так, чтобы она влезла в width пикселей."""
+    words = text.split()
+    if not words:
+        return []
+    lines: list[str] = []
+    current = words[0]
+    for word in words[1:]:
+        candidate = f"{current} {word}"
+        if font.measure(candidate) <= width:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return lines
+
+
 class Popup(tk.Toplevel):
     """Короткоживущее окно-напоминание. Живёт отдельным процессом."""
 
     W, H = 468, 208
+    TEXT_LEFT = 48      # отступ текста слева
+    TEXT_RIGHT = 104    # место под мини-циферблат справа
+    BLOCK_TOP = 62      # где начинается текст под заголовком
+    LINE_STEP = 22
 
     def __init__(self, root: tk.Misc, fonts: "Fonts", scale: float, title: str,
                  lines: list[str], buttons: list[tuple[str, str, Callable[[], None]]],
@@ -1127,6 +1149,7 @@ class Popup(tk.Toplevel):
         self.autoclose = autoclose
         self.total = autoclose
         self.scale = scale
+        self._layout()
         self.overrideredirect(True)
         try:
             self.attributes("-topmost", True)
@@ -1139,6 +1162,23 @@ class Popup(tk.Toplevel):
         self._place()
         self.render()
         self.after(1000, self._tick)
+
+    def _layout(self) -> None:
+        """Переносим длинный текст по словам и растягиваем карточку по высоте.
+
+        Русские фразы легко выходят за 468 точек: без переноса вторая половина
+        строки уезжала под часы и обрезалась.
+        """
+        width = self.W - self.TEXT_LEFT - self.TEXT_RIGHT
+        blocks: list[tuple[str, object, str]] = []
+        for index, line in enumerate(self.lines[:2]):
+            font = self.fonts.label_sm if index == 0 else self.fonts.small
+            color = C["muted"] if index == 0 else C["faint"]
+            for part in wrap_text(font, line, width) or [""]:
+                blocks.append((part, font, color))
+        self.blocks = blocks or [("", self.fonts.label_sm, C["muted"])]
+        needed = self.BLOCK_TOP + self.LINE_STEP * len(self.blocks) + 68
+        self.H = max(self.H, needed)
 
     def _place(self) -> None:
         self.update_idletasks()
@@ -1168,12 +1208,14 @@ class Popup(tk.Toplevel):
         s.begin()
         p.rrect(0, 0, self.W, self.H, 20, fill=C["card2"], outline=mix(C["card2"], self.accent, 0.55), width=1.5)
         # акцентная полоса слева, ровно по высоте текстового блока
-        p.rrect(26, 28, 32, 100, 3, fill=self.accent)
+        block_bottom = self.BLOCK_TOP + self.LINE_STEP * (len(self.blocks) - 1) + 8
+        p.rrect(26, 28, 32, max(76, block_bottom), 3, fill=self.accent)
 
         p.text(48, 32, self.title_text, f.h2, C["text"], anchor="w")
-        p.text(48, 62, self.lines[0] if self.lines else "", f.label_sm, C["muted"], anchor="w")
-        if len(self.lines) > 1:
-            p.text(48, 84, self.lines[1], f.small, C["faint"], anchor="w")
+        y = self.BLOCK_TOP
+        for text, font, color in self.blocks:
+            p.text(self.TEXT_LEFT, y, text, font, color, anchor="w")
+            y += self.LINE_STEP
 
         # мини-циферблат справа
         gx, gy, gr = self.W - 62, 62, 26

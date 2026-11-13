@@ -184,25 +184,106 @@ def request_tray(cmd: str) -> bool:
 # --------------------------------------------------------------------------- #
 #  Запуск процессов
 # --------------------------------------------------------------------------- #
+def _child_stream():
+    """Куда писать вывод дочерних процессов: в журнал, а не в /dev/null.
+
+    Из автозапуска stderr никто не читает, а ребёнок может упасть на импорте
+    tkinter или на отсутствии дисплея — без общего журнала такой отказ
+    выглядит как «нажал на иконку, ничего не произошло».
+    """
+    from . import notify  # локально: notify ни от чего в session не зависит
+
+    try:
+        path = notify.log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return open(path, "a", encoding="utf-8", buffering=1)
+    except OSError:
+        return subprocess.DEVNULL
+
+
 def spawn(args: list[str], *, interpreter: Optional[str] = None) -> Optional[subprocess.Popen]:
     script = launcher()
     if script is None:
         return None
+    stream = _child_stream()
     try:
         return subprocess.Popen(
             [interpreter or sys.executable, str(script), *args, *child_args()],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=stream,
+            stderr=stream,
+            stdin=subprocess.DEVNULL,
             start_new_session=True,
         )
-    except OSError:
+    except OSError as error:
+        from . import notify
+
+        notify.log(f"не удалось запустить {args}: {error}")
         return None
+    finally:
+        if stream is not subprocess.DEVNULL:
+            stream.close()  # копия в родителе больше не нужна, ребёнок держит свою
+
+
+_gui_interpreter_cache: Optional[str] = None
+
+
+def _tkinter_works(interpreter: str) -> bool:
+    if not Path(interpreter).exists():
+        return False
+    try:
+        result = subprocess.run(
+            [interpreter, "-c", "import tkinter"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def tkinter_map() -> dict[str, bool]:
+    """Есть ли tkinter в каждом из кандидатов — этим пользуется --doctor."""
+    return {path: _tkinter_works(path) for path in _candidate_interpreters()}
+
+
+def gui_interpreter() -> str:
+    """Интерпретатор, который умеет tkinter.
+
+    Иконку иногда запускает системный Python (в нём есть PyGObject), а окно
+    требует tkinter — и он может быть установлен совсем другому Python.
+    Тогда клик по иконке молча ничего не делает: процесс окна умирает на
+    импорте. Поэтому для окна выбираем интерпретатор с tkinter.
+    """
+    global _gui_interpreter_cache
+    if _gui_interpreter_cache and Path(_gui_interpreter_cache).exists():
+        return _gui_interpreter_cache
+    if _tkinter_works(sys.executable):
+        _gui_interpreter_cache = sys.executable
+        return sys.executable
+    for candidate in _candidate_interpreters():
+        if candidate != sys.executable and _tkinter_works(candidate):
+            from . import notify
+
+            notify.log(f"окно запускаю через {candidate}: в {sys.executable} нет tkinter")
+            _gui_interpreter_cache = candidate
+            return candidate
+    _gui_interpreter_cache = sys.executable
+    return sys.executable
 
 
 def spawn_gui() -> bool:
     # именно --window: обычный запуск теперь поднимает только иконку в трее,
     # и без флага клик по иконке приводил бы к процессу без окна
-    return spawn(["--window"]) is not None
+    from . import notify
+
+    interpreter = gui_interpreter()
+    process = spawn(["--window"], interpreter=interpreter)
+    if process is None:
+        notify.log("окно не запустилось: не нашёл nightfall.py или интерпретатор")
+        return False
+    notify.log(f"окно запускаю (pid {process.pid}, {interpreter})")
+    return True
 
 
 def _candidate_interpreters() -> list[str]:

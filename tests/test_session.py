@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import socket
 import subprocess
@@ -41,11 +42,13 @@ class PathsTest(unittest.TestCase):
         self.assertEqual(argv[-4:], ["--state", "/tmp/y/s.json", "--socket", "/tmp/y/n.sock"])
 
     def test_spawn_gui_asks_for_window_explicitly(self) -> None:
-        with mock.patch.object(subprocess, "Popen") as popen:
+        with mock.patch.object(session, "gui_interpreter", return_value="/usr/bin/python3"), \
+                mock.patch.object(subprocess, "Popen") as popen:
             self.assertTrue(session.spawn_gui())
         argv = popen.call_args[0][0]
         # без --window процесс поднимет только иконку и тихо завершится
         self.assertIn("--window", argv)
+        self.assertEqual(argv[0], "/usr/bin/python3")
 
     def test_make_client_uses_same_paths(self) -> None:
         session.configure("/tmp/z/s.json", "/tmp/z/n.sock")
@@ -385,3 +388,94 @@ class DiscoverDisplayTest(unittest.TestCase):
             self.assertTrue(session.display_available())
         with mock.patch.object(session, "discover_display", return_value=None):
             self.assertFalse(session.display_available())
+
+
+class GuiInterpreterTest(unittest.TestCase):
+    """Иконка и окно могут запускаться разными Python — проверяем, что нужным."""
+
+    def setUp(self) -> None:
+        session._gui_interpreter_cache = None
+        self.addCleanup(setattr, session, "_gui_interpreter_cache", None)
+
+    def test_prefers_current_python_when_it_has_tkinter(self) -> None:
+        with mock.patch.object(session, "_tkinter_works", return_value=True):
+            self.assertEqual(session.gui_interpreter(), session.sys.executable)
+
+    def test_falls_back_to_python_with_tkinter(self) -> None:
+        def has_tkinter(interpreter: str) -> bool:
+            return interpreter == "/usr/bin/python3"
+
+        with mock.patch.object(session, "_tkinter_works", side_effect=has_tkinter), \
+                mock.patch.object(session, "_candidate_interpreters",
+                                  return_value=[session.sys.executable, "/usr/bin/python3"]):
+            self.assertEqual(session.gui_interpreter(), "/usr/bin/python3")
+
+    def test_remembers_the_choice(self) -> None:
+        with mock.patch.object(session, "_tkinter_works", return_value=True) as probe:
+            session.gui_interpreter()
+            session.gui_interpreter()
+        self.assertEqual(probe.call_count, 1)
+
+    def test_tkinter_map_reports_every_candidate(self) -> None:
+        with mock.patch.object(session, "_tkinter_works",
+                               side_effect=lambda path: path.endswith("python3.13")), \
+                mock.patch.object(session, "_candidate_interpreters",
+                                  return_value=["/usr/local/bin/python3.13", "/usr/bin/python3"]):
+            self.assertEqual(session.tkinter_map(),
+                             {"/usr/local/bin/python3.13": True, "/usr/bin/python3": False})
+
+
+class ChildOutputTest(unittest.TestCase):
+    """Вывод детей идёт в журнал: иначе падение окна неотличимо от «не откликается»."""
+
+    def test_child_output_goes_to_journal(self) -> None:
+        import tempfile
+        from pathlib import Path as PathType
+
+        from nightfall import notify
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict("os.environ", {"XDG_STATE_HOME": tmp}):
+                stream = session._child_stream()
+                self.assertIsNot(stream, subprocess.DEVNULL)
+                stream.write("окно упало: нет tkinter\n")
+                stream.close()
+                self.assertIn("нет tkinter", notify.log_path().read_text(encoding="utf-8"))
+                self.assertTrue(PathType(notify.log_path()).exists())
+
+
+class TrayClickTest(unittest.TestCase):
+    """Клик по иконке обязан оставлять след: и в журнале, и на экране."""
+
+    def setUp(self) -> None:
+        from nightfall import tray
+
+        self.tray = tray
+        tray._last_failure = 0.0
+
+    def test_click_logs_and_opens_window(self) -> None:
+        with mock.patch.object(session, "toggle_window", return_value=True), \
+                mock.patch.object(self.tray.notify, "log") as log, \
+                mock.patch.object(session, "spawn") as spawn:
+            self.tray._toggle()
+        self.assertIn("клик по иконке", log.call_args[0][0])
+        spawn.assert_not_called()
+
+    def test_broken_click_shows_card_instead_of_silence(self) -> None:
+        with mock.patch.object(session, "toggle_window", return_value=False), \
+                mock.patch.object(self.tray.notify, "log"), \
+                mock.patch.object(session, "spawn") as spawn:
+            self.tray._toggle()
+        argv = spawn.call_args[0][0]
+        self.assertEqual(argv[0], "--popup-json")
+        # json пишется ASCII-escape'ами: локаль может быть не UTF-8
+        self.assertEqual(json.loads(argv[1])["title"], "Окно не открылось")
+
+    def test_failure_card_is_not_repeated_every_click(self) -> None:
+        with mock.patch.object(session, "toggle_window", return_value=False), \
+                mock.patch.object(self.tray.notify, "log"), \
+                mock.patch.object(session, "spawn") as spawn:
+            self.tray._toggle()
+            self.tray._toggle()
+            self.tray._toggle()
+        self.assertEqual(spawn.call_count, 1)

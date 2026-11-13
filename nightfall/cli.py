@@ -343,6 +343,12 @@ def run_doctor() -> int:
         print("tkinter            : есть — окно и напоминания возможны")
     except Exception as error:  # noqa: BLE001
         print(f"tkinter            : нет ({error}) — окно и карточки недоступны")
+    interpreters = session.tkinter_map()
+    if len(interpreters) > 1:
+        pairs = ", ".join(f"{path} ({'есть' if ok else 'нет'})"
+                          for path, ok in interpreters.items())
+        print(f"tkinter в python   : {pairs}")
+    print(f"окно запускается   : {session.gui_interpreter()}")
     found = session.detect_all()
     if found:
         pairs = ", ".join(f"{name} ({path})" for name, path in found.items())

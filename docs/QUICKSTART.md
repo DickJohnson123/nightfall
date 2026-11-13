@@ -198,6 +198,7 @@ python3 nightfall.py --tray-backend detect     # appindicator / statusicon / yad
 | Окно больше экрана, низ не видно | окно подстраивается само; если всё равно велико — запустить с `NIGHTFALL_SCALE=0.85 nightfall` |
 | После включения компьютера иконки нет | служба поднимает её сама, как только появляется дисплей (до 20 с); проверить журнал: `nightfall --doctor` и `nightfall --logs 30` |
 | Нет иконки рядом с часами | поставить механизм иконки: `sudo apt install python3-gi gir1.2-gtk-3.0` или `sudo apt install yad`, затем `nightfall --tray-backend detect`; без иконки всё работает, просто окно закрывается совсем |
+| Иконка есть, но клик ничего не делает | `nightfall --logs 20`: если есть строка «клик по иконке», окно не смогло стартовать — обычно не хватает `sudo apt install python3-tk`; Nightfall подберёт Python с tkinter сам, а при неудаче покажет карточку «Окно не открылось» |
 | Иконка есть, но клик открывает меню | это AppIndicator: окно открывает первый пункт меню (ограничение libappindicator) |
 | Хочу начать заново | Настройки → «Сбросить прогресс» (история сохранится в `state-*.json.bak`) |
 | Где данные | `~/.config/nightfall/state.json` |
